@@ -9,20 +9,28 @@ import pickle
 
 class TestContainer(unittest.TestCase):
 
-    def test_ctor(self):
+    def test_ctor_empty(self):
+        c = Container()
+        assert len(c) == 0
+        assert list(c.items()) == []
+        assert c == Container(c)
+
+    def test_ctor_chained(self):
         c = Container(a=1)(b=2)(c=3)(d=4)
         assert c == Container(c)
 
     def test_ctor_dict(self):
-        c = Container({'a': 1})
-        d = Container(a=1)
-        assert c == d
+        c = Container(a=1)(b=2)(c=3)(d=4)
+        c = Container(c)
+        assert len(c) == 4
+        assert list(c.items()) == [('a',1),('b',2),('c',3),('d',4)]
 
     @pytest.mark.xfail(not supportskwordered, reason="ordered kw was introduced in 3.6")
     def test_ctor_orderedkw(self):
         c = Container(a=1)(b=2)(c=3)(d=4)
         d = Container(a=1, b=2, c=3, d=4)
         assert c == d
+        assert len(c) == len(d)
         assert list(c.items()) == list(d.items())
 
     @pytest.mark.xfail(reason="regression, Container was reimplemented, and broke")
@@ -119,6 +127,11 @@ class TestContainer(unittest.TestCase):
         d = Container(a=1)(b=2)(c=3)(d=4)(e=5)
         assert c == c
         assert c == d
+
+    def test_eq_numpy(self):
+        import numpy
+        c = Container(arr=numpy.zeros(10, dtype=numpy.uint8))
+        assert c == c
 
     def test_ne(self):
         c = Container(a=1)(b=2)(c=3)

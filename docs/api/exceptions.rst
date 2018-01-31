@@ -10,13 +10,14 @@ Core API: Exception types
 .. autofunction:: construct.StreamError
 
 .. autofunction:: construct.FormatFieldError
-.. autofunction:: construct.BitIntegerError
+.. autofunction:: construct.IntegerError
 
 .. autofunction:: construct.StringError
 
 .. autofunction:: construct.MappingError
 
 .. autofunction:: construct.RangeError
+.. autofunction:: construct.RepeatError
 
 .. autofunction:: construct.ConstError
 .. autofunction:: construct.ExplicitError
@@ -29,4 +30,5 @@ Core API: Exception types
 
 .. autofunction:: construct.TerminatedError
 
+.. autofunction:: construct.RawCopyError
 .. autofunction:: construct.ChecksumError

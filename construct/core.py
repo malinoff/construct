@@ -11,39 +11,43 @@ from construct.expr import *
 #===============================================================================
 class ConstructError(Exception):
     pass
-class StreamError(ConstructError):
-    pass
-class FormatFieldError(ConstructError):
-    pass
 class SizeofError(ConstructError):
     pass
 class AdaptationError(ConstructError):
     pass
-class RangeError(ConstructError):
+class ValidationError(ConstructError):
     pass
-class SwitchError(ConstructError):
+class StreamError(ConstructError):
     pass
-class SelectError(ConstructError):
+class FormatFieldError(ConstructError):
     pass
-class UnionError(ConstructError):
-    pass
-class TerminatedError(ConstructError):
-    pass
-class PaddingError(ConstructError):
-    pass
-class ConstError(ConstructError):
+class IntegerError(ConstructError):
     pass
 class StringError(ConstructError):
     pass
-class ChecksumError(ConstructError):
-    pass
-class ValidationError(ConstructError):
-    pass
-class BitIntegerError(ConstructError):
-    pass
 class MappingError(ConstructError):
     pass
+class RangeError(ConstructError):
+    pass
+class RepeatError(ConstructError):
+    pass
+class ConstError(ConstructError):
+    pass
 class ExplicitError(ConstructError):
+    pass
+class UnionError(ConstructError):
+    pass
+class SelectError(ConstructError):
+    pass
+class SwitchError(ConstructError):
+    pass
+class PaddingError(ConstructError):
+    pass
+class TerminatedError(ConstructError):
+    pass
+class RawCopyError(ConstructError):
+    pass
+class ChecksumError(ConstructError):
     pass
 
 
@@ -57,10 +61,20 @@ def singleton(arg):
 def _read_stream(stream, length):
     if length < 0:
         raise StreamError("length must be >= 0", length)
-    data = stream.read(length)
+    try:
+        data = stream.read(length)
+    except Exception:
+        raise StreamError("stream.read() failed, requested %s bytes" % (length,))
     if len(data) != length:
         raise StreamError("could not read enough bytes, expected %d, found %d" % (length, len(data)))
     return data
+
+
+def _read_stream_entire(stream):
+    try:
+        return stream.read()
+    except Exception:
+        raise StreamError("stream.read() failed when reading entire stream until EOF")
 
 
 def _write_stream(stream, length, data):
@@ -68,15 +82,34 @@ def _write_stream(stream, length, data):
         raise StreamError("length must be >= 0", length)
     if len(data) != length:
         raise StreamError("could not write bytes, expected %d, found %d" % (length, len(data)))
-    written = stream.write(data)
+    try:
+        written = stream.write(data)
+    except Exception:
+        raise StreamError("stream.write() failed, given %r" % (data,))
     if written is not None and written != length:
         raise StreamError("could not write bytes, expected %d, written %d" % (length, written))
+
+
+def _seek_stream(stream, offset, whence=0):
+    try:
+        return stream.seek(offset, whence)
+    except Exception:
+        raise StreamError("stream.seek failed: offset %s whence %s" % (offset, whence,))
+
+
+def _tell_stream(stream):
+    try:
+        return stream.tell()
+    except Exception:
+        raise StreamError("stream.tell failed")
 
 
 class CodeGen:
     def __init__(self):
         self.blocks = []
         self.nextid = 0
+        self.decompiledcache = {}
+        self.parsercache = {}
 
     def allocateId(self):
         self.nextid += 1
@@ -90,17 +123,8 @@ class CodeGen:
         if block not in self.blocks:
             self.blocks.append(block)
 
-    def appendnl(self):
-        self.blocks.append("")
-
-    def defer(self, name):
-        self.append("""
-            from construct import %s
-        """ % name)
-        return "%s._parse(io, None, None)" % name
-
     def toString(self):
-        return "\n".join(self.blocks)
+        return "\n".join(self.blocks + [""])
 
 
 #===============================================================================
@@ -121,14 +145,16 @@ class Construct(object):
     * ``sizeof()``
     * ``compile()``
     * ``benchmark()``
+    * ``testcompiled()``
 
     Subclass authors should not override the external methods. Instead, another API is available:
 
     * ``_parse()``
     * ``_build()``
     * ``_sizeof()``
-    * ``_compileparse()``
-    * ``_compilebuild()``
+    * ``_emitdecompiled()``
+    * ``_emitparse()``
+    * ``_emitbuild()``
     * ``__getstate__()``
     * ``__setstate__()``
 
@@ -136,8 +162,8 @@ class Construct(object):
 
     All constructs have a name and flags. The name is used for naming struct members and context dictionaries. Note that the name can be a string, or None by default. A single underscore "_" is a reserved name, used as up-level in nested containers. The name should be descriptive, short, and valid as a Python identifier, although these rules are not enforced. The flags specify additional behavioral information about this construct. Flags are used by enclosing constructs to determine a proper course of action. Flags are often inherited from inner subconstructs but that depends on each class.
     """
-
     __slots__ = ["name", "flagbuildnone", "flagembedded"]
+
     def __init__(self):
         self.name = None
         self.flagbuildnone = False
@@ -290,25 +316,24 @@ class Construct(object):
         """
         code = CodeGen()
         code.append("""
+            from construct import *
+            from construct.lib import *
+            from io import BytesIO
+            from struct import pack, unpack, calcsize
+            import collections
             def read_bytes(io, count):
                 assert count >= 0
                 data = io.read(count)
                 assert len(data) == count
                 return data
-            from io import BytesIO
             def restream(data, func):
                 return func(BytesIO(data))
         """)
         code.append("""
-            def parseall(io, context):
-                this = context
+            def parseall(io, this):
                 return %s
-        """ % (self._compileparse(code),))
-        code.append("""
-            from construct import Compiled
             compiledschema = Compiled(None, None, parseall)
-        """)
-        code.appendnl()
+        """ % (self._compileparse(code),))
 
         source = code.toString()
         from types import ModuleType
@@ -321,13 +346,57 @@ class Construct(object):
         compiledschema.defersubcon = self
         return compiledschema
 
+    def _decompile(self, code):
+        """Used internally."""
+        if id(self) in code.decompiledcache:
+            return code.decompiledcache[id(self)]
+
+        try:
+            cname = "decompiled_%s" % code.allocateId()
+            code.append("""
+                %s = %s
+            """ % (cname, self._emitdecompiled(code), ))
+            code.decompiledcache[id(self)] = cname
+            return cname
+        except NotImplementedError:
+            cname = "decompiled_%s" % code.allocateId()
+            code.append("""
+                %s = Decompiled(lambda io,this: %s)
+            """ % (cname, self._compileparse(code), ))
+            code.decompiledcache[id(self)] = cname
+            return cname
+
     def _compileparse(self, code):
+        """Used internally."""
+        if id(self) in code.parsercache:
+            return code.parsercache[id(self)]
+
+        try:
+            emitted = self._emitparse(code)
+            code.parsercache[id(self)] = emitted
+            return emitted
+        except NotImplementedError:
+            emitted = "%s._parse(io, this, None)" % (self._decompile(code), )
+            code.parsercache[id(self)] = emitted
+            return emitted
+
+    def _compilebuild(self, code):
+        """Used internally."""
+        raise NotImplementedError
+
+    def _emitdecompiled(self, code):
         """
         Override in your subclass.
         """
         raise NotImplementedError
 
-    def _compilebuild(self, code):
+    def _emitparse(self, code):
+        """
+        Override in your subclass.
+        """
+        raise NotImplementedError
+
+    def _emitbuild(self, code):
         """
         Override in your subclass.
         """
@@ -489,7 +558,7 @@ class Tunnel(Subconstruct):
     Needs to implement ``_decode()`` for parsing and ``_encode()`` for building.
     """
     def _parse(self, stream, context, path):
-        data = stream.read()  # reads entire stream
+        data = _read_stream_entire(stream)  # reads entire stream
         data = self._decode(data, context)
         return self.subcon.parse(data, **context)
     def _build(self, obj, stream, context, path):
@@ -537,10 +606,10 @@ class Compiled(Construct):
         return self
 
     def _compileparse(self, code):
-        raise ConstructError("Compiled instance can compile() but cannot _compileparse() or _compilebuild()")
+        raise ConstructError("Compiled instance can compile() into self but cannot _compileparse() or _compilebuild()")
 
     def _compilebuild(self, code):
-        raise ConstructError("Compiled instance can compile() but cannot _compileparse() or _compilebuild()")
+        raise ConstructError("Compiled instance can compile() into self but cannot _compileparse() or _compilebuild()")
 
     def tofile(self, filename):
         """
@@ -558,11 +627,23 @@ class CompilableMacro(Subconstruct):
         super(CompilableMacro, self).__init__(subcon)
         self.compileparsefunc = compileparsefunc
 
-    def _compileparse(self, code):
+    def _emitparse(self, code):
         return self.compileparsefunc(self, code)
 
-    def _compilebuild(self, code):
+    def _emitbuild(self, code):
         raise NotImplementedError
+
+
+class Decompiled(Construct):
+    """Used internally."""
+    __slots__ = ["parsefunc"]
+
+    def __init__(self, parsefunc):
+        super(Decompiled, self).__init__()
+        self.parsefunc = parsefunc
+
+    def _parse(self, stream, context, path):
+        return self.parsefunc(stream, context)
 
 
 #===============================================================================
@@ -597,23 +678,28 @@ class Bytes(Construct):
         ...
     """
     __slots__ = ["length"]
+
     def __init__(self, length):
         super(Bytes, self).__init__()
         self.length = length
+
     def _parse(self, stream, context, path):
         length = self.length(context) if callable(self.length) else self.length
         return _read_stream(stream, length)
+
     def _build(self, obj, stream, context, path):
         length = self.length(context) if callable(self.length) else self.length
         data = integer2bytes(obj, length) if isinstance(obj, int) else obj
         _write_stream(stream, length, data)
         return data
+
     def _sizeof(self, context, path):
         try:
             return self.length(context) if callable(self.length) else self.length
         except (KeyError, AttributeError):
             raise SizeofError("cannot calculate size, key not found in context")
-    def _compileparse(self, code):
+
+    def _emitparse(self, code):
         return "read_bytes(io, %s)" % (self.length,)
 
 
@@ -624,6 +710,8 @@ class GreedyBytes(Construct):
 
     Parses the stream to the end. Builds into the stream directly (without checks). Size is undefined.
 
+    :raises StreamError: stream failed when reading until EOF
+
     Example::
 
         >>> GreedyBytes.parse(b"asislight")
@@ -631,11 +719,14 @@ class GreedyBytes(Construct):
         >>> GreedyBytes.build(b"asislight")
         b'asislight'
     """
+
     def _parse(self, stream, context, path):
-        return stream.read()
+        return _read_stream_entire(stream)
+
     def _build(self, obj, stream, context, path):
         stream.write(obj)
-    def _compileparse(self, code):
+
+    def _emitparse(self, code):
         return "io.read()"
 
 
@@ -649,7 +740,7 @@ def Bitwise(subcon):
 
     .. warning:: Remember that subcon must consume or produce an amount of bytes that is a multiple of encoding or decoding units. For example, in a Bitwise context you should process a multiple of 8 bits or the stream will fail during parsing/building.
 
-    .. warning:: Do NOT use pointers inside Restreamed context.
+    .. warning:: Do NOT use seeking/telling classes inside Restreamed context.
 
     :param subcon: Construct instance, any field that works with bits (like BitsInteger) or is bit-byte agnostic (like Struct or Flag)
 
@@ -665,13 +756,10 @@ def Bitwise(subcon):
         >>> d.sizeof()
         1
     """
-    macro = Restreamed(subcon, bits2bytes, 8, bytes2bits, 1, lambda n: n//8)
-    def _compileparse(self, code):
-        code.append("""
-            from construct.lib import bits2bytes, bytes2bits
-        """)
+    macro = Restreamed(subcon, bytes2bits, 1, bits2bytes, 8, lambda n: n//8)
+    def _emitparse(self, code):
         return "restream(bytes2bits(read_bytes(io, %s)), lambda io: %s)" % (subcon.sizeof()//8, subcon._compileparse(code), )
-    return CompilableMacro(macro, _compileparse)
+    return CompilableMacro(macro, _emitparse)
 
 
 def Bytewise(subcon):
@@ -684,7 +772,7 @@ def Bytewise(subcon):
 
     .. warning:: Remember that subcon must consume or produce an amount of bytes that is a multiple of encoding or decoding units. For example, in a Bitwise context you should process a multiple of 8 bits or the stream will fail during parsing/building.
 
-    .. warning:: Do NOT use pointers inside Restreamed context.
+    .. warning:: Do NOT use seeking/telling classes inside Restreamed context.
 
     :param subcon: Construct instance, any field that works with bytes or is bit-byte agnostic
 
@@ -702,7 +790,10 @@ def Bytewise(subcon):
         >>> d.sizeof()
         1
     """
-    return Restreamed(subcon, bytes2bits, 1, bits2bytes, 8, lambda n: n*8)
+    macro = Restreamed(subcon, bits2bytes, 8, bytes2bits, 1, lambda n: n*8)
+    def _emitparse(self, code):
+        return "restream(bits2bytes(read_bytes(io, %s)), lambda io: %s)" % (subcon.sizeof()*8, subcon._compileparse(code), )
+    return CompilableMacro(macro, _emitparse)
 
 
 #===============================================================================
@@ -722,8 +813,6 @@ class FormatField(Construct):
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
     :raises FormatFieldError: wrong format string, or struct.(un)pack complained about the value
 
-    bug???
-
     Example::
 
         >>> d = FormatField(">", "H") or Int16ub
@@ -735,6 +824,7 @@ class FormatField(Construct):
         2
     """
     __slots__ = ["fmtstr","length"]
+
     def __init__(self, endianity, format):
         if endianity not in list("=<>"):
             raise ValueError("endianity must be like: = < >", endianity)
@@ -743,24 +833,25 @@ class FormatField(Construct):
         super(FormatField, self).__init__()
         self.fmtstr = endianity+format
         self.length = struct.calcsize(endianity+format)
+
     def _parse(self, stream, context, path):
         data = _read_stream(stream, self.length)
         try:
             return struct.unpack(self.fmtstr, data)[0]
         except Exception:
             raise FormatFieldError("struct %r error during parsing" % self.fmtstr)
+
     def _build(self, obj, stream, context, path):
         try:
             data = struct.pack(self.fmtstr, obj)
         except Exception:
             raise FormatFieldError("struct %r error during building, given value %r" % (self.fmtstr, obj))
         _write_stream(stream, self.length, data)
+
     def _sizeof(self, context, path):
         return self.length
-    def _compileparse(self, code):
-        code.append("""
-            from struct import pack, unpack, calcsize
-        """)
+
+    def _emitparse(self, code):
         return "unpack(%r, read_bytes(io, %s))[0]" % (self.fmtstr, self.length)
 
 
@@ -777,7 +868,7 @@ class BytesInteger(Construct):
     :param swapped: bool, whether to swap byte order (little endian), default is False (big endian)
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
-    :raises BitIntegerError: given a negative value when field is not signed
+    :raises IntegerError: given a negative value when field is not signed, or not an integer
 
     Can propagate any exception from the lambda, possibly non-ConstructError.
 
@@ -792,31 +883,38 @@ class BytesInteger(Construct):
         4
     """
     __slots__ = ["length", "signed", "swapped"]
+
     def __init__(self, length, signed=False, swapped=False):
         super(BytesInteger, self).__init__()
         self.length = length
         self.signed = signed
         self.swapped = swapped
+
     def _parse(self, stream, context, path):
         length = self.length(context) if callable(self.length) else self.length
         data = _read_stream(stream, length)
         if self.swapped:
             data = data[::-1]
         return bytes2integer(data, self.signed)
+
     def _build(self, obj, stream, context, path):
+        if not isinstance(obj, integertypes):
+            raise IntegerError("value is not an integer")
         if obj < 0 and not self.signed:
-            raise BitIntegerError("object is negative, but field is not signed", obj)
+            raise IntegerError("value is negative, but field is not signed", obj)
         length = self.length(context) if callable(self.length) else self.length
         data = integer2bytes(obj, length)
         if self.swapped:
             data = data[::-1]
         _write_stream(stream, len(data), data)
+
     def _sizeof(self, context, path):
         try:
             return self.length(context) if callable(self.length) else self.length
         except (KeyError, AttributeError):
             raise SizeofError("cannot calculate size, key not found in context")
-    def _compileparse(self, code):
+
+    def _emitparse(self, code):
         return "int.from_bytes(read_bytes(io, %s), byteorder=%r, signed=%s)" % (self.length, 'little' if self.swapped else 'big', self.signed)
 
 
@@ -835,7 +933,7 @@ class BitsInteger(Construct):
     :param swapped: bool, whether to swap byte order (little endian), default is False (big endian)
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
-    :raises BitIntegerError: building and given a negative value when field is not signed
+    :raises IntegerError: given a negative value when field is not signed, or not an integer
 
     Can propagate any exception from the lambda, possibly non-ConstructError.
 
@@ -850,34 +948,42 @@ class BitsInteger(Construct):
         1
     """
     __slots__ = ["length", "signed", "swapped"]
+
     def __init__(self, length, signed=False, swapped=False):
         super(BitsInteger, self).__init__()
         self.length = length
         self.signed = signed
         self.swapped = swapped
+
     def _parse(self, stream, context, path):
         length = self.length(context) if callable(self.length) else self.length
         data = _read_stream(stream, length)
         if self.swapped:
-            data = swapbytes(data, 8)
+            if length & 7:
+                raise IntegerError("little-endianness is only defined for multiples of 8 bits")
+            data = swapbytes(data)
         return bits2integer(data, self.signed)
+
     def _build(self, obj, stream, context, path):
+        if not isinstance(obj, integertypes):
+            raise IntegerError("value is not an integer")
         if obj < 0 and not self.signed:
-            raise BitIntegerError("object is negative, but field is not signed", obj)
+            raise IntegerError("value is negative, but field is not signed", obj)
         length = self.length(context) if callable(self.length) else self.length
         data = integer2bits(obj, length)
         if self.swapped:
-            data = swapbytes(data, 8)
+            if length & 7:
+                raise IntegerError("little-endianness is only defined for multiples of 8 bits")
+            data = swapbytes(data)
         _write_stream(stream, len(data), data)
+
     def _sizeof(self, context, path):
         try:
             return self.length(context) if callable(self.length) else self.length
         except (KeyError, AttributeError):
             raise SizeofError("cannot calculate size, key not found in context")
-    def _compileparse(self, code):
-        code.append("""
-            from construct.lib import bits2integer, integer2bits
-        """)
+
+    def _emitparse(self, code):
         return "bits2integer(read_bytes(io, %s)%s, %s)" % (self.length, "[::-1]" if self.swapped else "", self.signed, )
 
 
@@ -1068,7 +1174,7 @@ class VarInt(Construct):
     Parses into an integer. Builds from an integer. Size is undefined.
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
-    bug???
+    :raises IntegerError: given a negative value, or not an integer
 
     Example::
 
@@ -1077,6 +1183,7 @@ class VarInt(Construct):
         >>> VarInt.build(2**100)
         b'\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x04'
     """
+
     def _parse(self, stream, context, path):
         acc = []
         while True:
@@ -1088,15 +1195,473 @@ class VarInt(Construct):
         for b in reversed(acc):
             num = (num << 7) | b
         return num
+
     def _build(self, obj, stream, context, path):
+        if not isinstance(obj, integertypes):
+            raise IntegerError("value is not an integer")
         if obj < 0:
-            raise ValueError("varint cannot build from negative number: %r" % (obj,))
+            raise IntegerError("varint cannot build from negative number: %r" % (obj,))
         while obj > 0b01111111:
             _write_stream(stream, 1, int2byte(0b10000000 | (obj & 0b01111111)))
             obj >>= 7
         _write_stream(stream, 1, int2byte(obj))
-    def _compileparse(self, code):
-        return code.defer("VarInt")
+
+    def _emitdecompiled(self, code):
+        return "VarInt"
+
+
+#===============================================================================
+# strings
+#===============================================================================
+globalstringencoding = None
+
+
+@singleton
+class StringsAsBytes:
+    pass
+
+
+def setglobalstringencoding(encoding):
+    r"""
+    Sets the encoding globally for all String PascalString CString GreedyString instances. Note that encoding specified expiciltly in a particular construct supersedes it. Note also that global encoding is applied during parsing and building (not class instantiation).
+
+    See :class:`~construct.core.StringsAsBytes` for non-encoding, allowing using `str` on Python 2.
+
+    :param encoding: string like "utf8", or StringsAsBytes, or None (disable global override)
+    """
+    global globalstringencoding
+    globalstringencoding = encoding
+
+
+class StringEncoded(Adapter):
+    """Used internally."""
+    __slots__ = ["encoding"]
+
+    def __init__(self, subcon, encoding):
+        super(StringEncoded, self).__init__(subcon)
+        self.encoding = encoding
+
+    def _decode(self, obj, context):
+        encoding = self.encoding or globalstringencoding
+        if isinstance(encoding, str):
+            return obj.decode(encoding)
+        if isinstance(encoding, StringsAsBytes.__class__):
+            if not isinstance(obj, bytestringtype):
+                raise StringError("decoding must result in bytes type")
+            return obj
+        raise StringError("String* classes require explicit encoding")
+
+    def _encode(self, obj, context):
+        encoding = self.encoding or globalstringencoding
+        if isinstance(encoding, str):
+            return obj.encode(encoding)
+        if isinstance(encoding, StringsAsBytes.__class__):
+            if not isinstance(obj, bytestringtype):
+                raise StringError("encoding must result in bytes type")
+            return obj
+        raise StringError("String* classes require explicit encoding")
+
+    def _emitparse(self, code):
+        encoding = self.encoding or globalstringencoding
+        if isinstance(encoding, str):
+            return "(%s).decode(%r)" % (self.subcon._compileparse(code), encoding, )
+        if isinstance(encoding, StringsAsBytes.__class__):
+            return "(%s)" % (self.subcon._compileparse(code), )
+        raise StringError("String* classes require explicit encoding")
+
+
+class StringPaddedTrimmed(Adapter):
+    """Used internally."""
+    __slots__ = ["length", "padchar", "paddir", "trimdir"]
+
+    def __init__(self, length, subcon, padchar=b"\x00", paddir="right", trimdir="right"):
+        if not isinstance(padchar, bytestringtype) or len(padchar) != 1:
+            raise StringError("padchar must be b-string character")
+        if paddir not in ["right","left","center"]:
+            raise StringError("paddir must be one of: right left center")
+        if trimdir not in ["right","left"]:
+            raise StringError("trimdir must be one of: right left")
+        super(StringPaddedTrimmed, self).__init__(subcon)
+        self.length = length
+        self.padchar = padchar
+        self.paddir = paddir
+        self.trimdir = trimdir
+
+    def _decode(self, obj, context):
+        if self.paddir == "right":
+            obj = obj.rstrip(self.padchar)
+        if self.paddir == "left":
+            obj = obj.lstrip(self.padchar)
+        if self.paddir == "center":
+            obj = obj.strip(self.padchar)
+        return obj
+
+    def _encode(self, obj, context):
+        length = self.length(context) if callable(self.length) else self.length
+        if self.paddir == "right":
+            obj = obj.ljust(length, self.padchar)
+        if self.paddir == "left":
+            obj = obj.rjust(length, self.padchar)
+        if self.paddir == "center":
+            obj = obj.center(length, self.padchar)
+        if len(obj) > length:
+            if self.trimdir == "right":
+                obj = obj[:length]
+            if self.trimdir == "left":
+                obj = obj[-length:]
+        return obj
+
+    def _emitparse(self, code):
+        if self.paddir == "right":
+            func = "rstrip"
+        if self.paddir == "left":
+            func = "lstrip"
+        if self.paddir == "center":
+            func = "strip"
+        return "(%s).%s(%r)" % (self.subcon._compileparse(code), func, self.padchar)
+
+
+def String(length, encoding=None, padchar=b"\x00", paddir="right", trimdir="right"):
+    r"""
+    Configurable, fixed-length or variable-length string field.
+
+    When parsing, the byte string is stripped of byte character (as specified) from the direction (as specified) then decoded (as specified). Length is an integer or context lambda.
+    When building, the string is encoded (as specified) then padded (as specified) from the direction (as specified) or trimmed (as specified).
+    Size is same as length parameter.
+
+    .. warning:: Do not use >1 byte encodings like UTF16 or UTF32 with String and CString classes. This a known bug that has something to do with the fact that library inherently works with bytes (not codepoints) and codepoint-to-byte conversions are too tricky.
+
+    :param length: integer or context lambda, length in bytes (not unicode characters)
+    :param encoding: string like "utf8", or StringsAsBytes, or None (use global override)
+    :param padchar: bytes character to pad out strings, by default b"\\x00"
+    :param paddir: string, direction to pad out strings (one of: right left both)
+    :param trimdir: string, direction to trim strings (one of: right left)
+
+    :raises StringError: String* classes require explicit encoding
+    :raises StringError: building a unicode string but no encoding
+    :raises StringError: padchar paddir trimdir are not valid
+
+    Can propagate any exception from the lambda, possibly non-ConstructError.
+
+    Example::
+
+        >>> d = String(10, encoding=StringsAsBytes)
+        >>> d.build(b"hello")
+        b'hello\x00\x00\x00\x00\x00'
+        >>> d.parse(_)
+        b'hello'
+        >>> d.sizeof()
+        10
+
+        >>> d = String(10, encoding="utf8")
+        >>> d.build(u"Афон")
+        b'\xd0\x90\xd1\x84\xd0\xbe\xd0\xbd\x00\x00'
+        >>> d.parse(_)
+        u'Афон'
+
+        >>> d = String(10, encoding=StringsAsBytes, padchar=b"XYZ", paddir="center")
+        >>> d.build(b"abc")
+        b'XXXabcXXXX'
+        >>> d.parse(b"XYZabcXYZY")
+        b'abc'
+
+        >>> d = String(10, encoding=StringsAsBytes, trimdir="right")
+        >>> d.build(b"12345678901234567890")
+        b'1234567890'
+    """
+    return StringEncoded(
+        StringPaddedTrimmed(length, Bytes(length), padchar, paddir, trimdir),
+        encoding)
+
+
+def PascalString(lengthfield, encoding=None):
+    r"""
+    Length-prefixed string. The length field can be variable length (such as VarInt) or fixed length (such as Int64ub). VarInt is recommended when designing new protocols. Stored length is in bytes, not characters.
+
+    Size is not defined.
+
+    .. note:: Encodings like UTF16 or UTF32 work fine with PascalString and GreedyString.
+
+    :param lengthfield: Construct instance, field used to parse and build the length (likw VarInt Int64ub)
+    :param encoding: string like "utf8", or StringsAsBytes, or None (use global override)
+
+    :raises StringError: String* classes require explicit encoding
+    :raises StringError: building a unicode string but no encoding
+
+    Example::
+
+        >>> d = PascalString(VarInt, encoding="utf8")
+        >>> d.build(u"Афон")
+        b'\x08\xd0\x90\xd1\x84\xd0\xbe\xd0\xbd'
+        >>> d.parse(_)
+        u'Афон'
+    """
+    return StringEncoded(Prefixed(lengthfield, GreedyBytes), encoding)
+
+
+def CString(terminators=b"\x00", encoding=None):
+    r"""
+    String ending in a terminating null byte (or null bytes in case of UTF16 UTF32).
+
+    reimplement???
+
+    By default, the terminator is the \\x00 byte character. Terminators field can be a longer bytes, and any one of the characters breaks parsing. First terminator byte is used when building.
+
+    .. warning:: Do not use >1 byte encodings like UTF16 or UTF32 with String and CString classes. This a known bug that has something to do with the fact that library inherently works with bytes (not codepoints) and codepoint-to-byte conversions are too tricky.
+
+    :param terminators: ??? sequence of valid terminators, first is used when building, all are used when parsing
+    :param encoding: string like "utf8", or StringsAsBytes, or None (use global override)
+
+    :raises StringError: String* classes require explicit encoding
+    :raises StringError: building a unicode string but no encoding
+
+    Example::
+
+        >>> d = CString(encoding="utf8")
+        >>> d.build(u"Афон")
+        b'\xd0\x90\xd1\x84\xd0\xbe\xd0\xbd\x00'
+        >>> d.parse(_)
+        u'Афон'
+    """
+    return StringEncoded(
+        ExprAdapter(
+            RepeatUntil(lambda obj,lst,ctx: int2byte(obj) in terminators, Byte),
+            decoder = lambda obj,ctx: b''.join(int2byte(c) for c in obj[:-1]),
+            encoder = lambda obj,ctx: iterateints(obj+terminators), ),
+        encoding)
+
+
+def GreedyString(encoding=None):
+    r"""
+    String that reads entire stream until EOF, and writes a given string as-is. If no encoding is specified, this is essentially GreedyBytes.
+
+    Analog to :class:`~construct.core.GreedyBytes` , and identical when no enoding is used.
+
+    .. note:: Encodings like UTF16 or UTF32 work fine with PascalString and GreedyString.
+
+    :param encoding: string like "utf8", or StringsAsBytes, or None (use global override)
+
+    :raises StringError: String* classes require explicit encoding
+    :raises StringError: building a unicode string but no encoding
+    :raises StreamError: stream failed when reading until EOF
+
+    Example::
+
+        >>> d = GreedyString(encoding="utf8")
+        >>> d.build(u"Афон")
+        b'\xd0\x90\xd1\x84\xd0\xbe\xd0\xbd'
+        >>> d.parse(_)
+        u'Афон'
+    """
+    return StringEncoded(GreedyBytes, encoding)
+
+
+#===============================================================================
+# mappings
+#===============================================================================
+@singleton
+class Flag(Construct):
+    r"""
+    One byte (or one bit) field that maps to True or False. Other non-zero bytes are also considered True. Size is defined as 1.
+
+    :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
+
+    Example::
+
+        >>> Flag.parse(b"\x01")
+        True
+        >>> Flag.build(True)
+        b'\x01'
+    """
+
+    def _parse(self, stream, context, path):
+        return _read_stream(stream, 1) != b"\x00"
+
+    def _build(self, obj, stream, context, path):
+        _write_stream(stream, 1, b"\x01" if obj else b"\x00")
+
+    def _sizeof(self, context, path):
+        return 1
+
+    def _emitparse(self, code):
+        return "(read_bytes(io, 1) != b'\\x00')"
+
+
+class Enum(Subconstruct):
+    r"""
+    Translates unicode label names to subcon values, and vice versa. 
+
+    semantics???
+    Size is same as subcon, unless it raises SizeofError.
+
+    :param subcon: Construct instance, subcon to map to/from
+    :param default: optional, keyword-only argument that specifies the default value to use when an unknown label gets build, can overlap with some existing label, if ``Pass`` then parsing returns "default" label and building skips stream
+    :param \*\*mapping: dict, mapping string names to values
+
+    :raises MappingError: label (during building) or value (during parsing) cannot be translated, and no default was provided
+
+    Example::
+
+        >>> d = Enum(Byte, zero=0, one=1)
+        >>> d.parse(b"\x01")
+        'one'
+        >>> d.parse(b"\xff")
+        construct.core.MappingError: no decoding mapping for 255
+        >>> d.build("one")
+        b'\x01'
+        >>> d.build(1)
+        b'\x01'
+    """
+    __slots__ = ["default", "encmapping", "decmapping"]
+
+    def __init__(self, subcon, default=NotImplemented, **mapping):
+        super(Enum, self).__init__(subcon)
+        self.default = default
+        self.encmapping =      {k:v for k,v in mapping.items()}
+        self.encmapping.update({v:v for k,v in mapping.items()})
+        self.decmapping =      {v:k for k,v in mapping.items()}
+        self.decmapping.update({k:k for k,v in mapping.items()})
+        if self.default is not NotImplemented and self.default is not Pass:
+            if True:
+                self.decmapping.update({"default":default})
+            if default not in self.decmapping:
+                self.decmapping.update({default:"default"})
+
+    def _parse(self, stream, context, path):
+        obj2 = self.subcon._parse(stream, context, path)
+        try:
+            obj = self.decmapping[obj2]
+        except KeyError:
+            if self.default is NotImplemented:
+                raise MappingError("parsing failed, no mapping for %r, no default either" % (obj2,))
+            if self.default is Pass:
+                return "default"
+            return "default"
+        return obj
+
+    def _build(self, obj, stream, context, path):
+        try:
+            obj2 = self.encmapping[obj]
+        except KeyError:
+            if self.default is NotImplemented:
+                raise MappingError("building failed, no mapping for %r, no default either" % (obj,))
+            if self.default is Pass:
+                return
+            obj = "default"
+            obj2 = self.default
+        self.subcon._build(obj2, stream, context, path)
+        return obj
+
+
+class FlagsEnum(Adapter):
+    r"""
+    Translates unicode label names to subcon integer (sub)values, and vice versa.
+
+    semantics???
+    Size is same as subcon, unless it raises SizeofError.
+
+    :param subcon: Construct instance, must operate on integers
+    :param \*\*flags: dict, mapping string names to integer values
+
+    Can raise arbitrary exceptions when computing | and & and value is non-integer.
+
+    Example::
+
+        >>> d = FlagsEnum(Byte, a=1, b=2, c=4, d=8)
+        >>> d.parse(b"\x03")
+        Container(c=False)(b=True)(a=True)(d=False)
+    """
+    __slots__ = ["flags"]
+
+    def __init__(self, subcon, **flags):
+        super(FlagsEnum, self).__init__(subcon)
+        self.flags = flags
+
+    def _decode(self, obj, context):
+        obj2 = FlagsContainer()
+        for name,value in self.flags.items():
+            obj2[name] = bool(obj & value)
+        return obj2
+
+    def _encode(self, obj, context):
+        try:
+            flags = 0
+            for name,value in obj.items():
+                if value:
+                    flags |= self.flags[name]
+            return flags
+        except AttributeError:
+            raise MappingError("building failed, object is not a dictionary: %r" % (obj,))
+        except KeyError:
+            raise MappingError("building failed, unknown flag: %s" % (name,))
+
+
+class Mapping(Adapter):
+    r"""
+    Adapter that maps objects to other objects. Translates objects before parsing and before building.
+
+    .. note:: It used to be used internally by Flag IfThenElse etc but became deprecated.
+
+    :param subcon: Construct instance, subcon to map to/from
+    :param decoding: dict, for decoding (parsing) mapping
+    :param encoding: dict, for encoding (building) mapping
+    :param decdefault: object, default return value when object is not found in the mapping, if no object is given then exception is raised, if ``Pass`` is used, the unmapped object is passed as-is
+    :param encdefault: object, default return value when object is not found in the mapping, if no object is given then exception is raised, if ``Pass`` is used, the unmapped object is passed as-is
+
+    Example::
+
+        ???
+    """
+    __slots__ = ["encoding", "decoding", "encdefault", "decdefault"]
+
+    def __init__(self, subcon, decoding, encoding, decdefault=NotImplemented, encdefault=NotImplemented):
+        super(Mapping, self).__init__(subcon)
+        self.decoding = decoding
+        self.encoding = encoding
+        self.decdefault = decdefault
+        self.encdefault = encdefault
+
+    def _decode(self, obj, context):
+        try:
+            return self.decoding[obj]
+        except (KeyError, TypeError):
+            if self.decdefault is NotImplemented:
+                raise MappingError("parsing failed, no decoding mapping for %r" % (obj,))
+            if self.decdefault is Pass:
+                return obj
+            return self.decdefault
+
+    def _encode(self, obj, context):
+        try:
+            return self.encoding[obj]
+        except (KeyError, TypeError):
+            if self.encdefault is NotImplemented:
+                raise MappingError("building failed, no encoding mapping for %r" % (obj,))
+            if self.encdefault is Pass:
+                return obj
+            return self.encdefault
+
+
+def SymmetricMapping(subcon, mapping, default=NotImplemented):
+    r"""
+    Defines a symmetric mapping, same mapping is used on parsing and building.
+
+    This is just a macro around :class:`~construct.core.Mapping`.
+
+    :param subcon: Construct instance, subcon to map to/from
+    :param mapping: dict, for decoding (parsing) mapping
+    :param default: object, default return value when object is not found in the mapping, if no object is given then exception is raised, if ``Pass`` is used, the unmapped object is passed as-is
+
+    Example::
+
+        ???
+    """
+    return Mapping(subcon,
+        decoding = dict((v,k) for k,v in mapping.items()),
+        encoding = mapping,
+        decdefault = default,
+        encdefault = default,
+    )
 
 
 #===============================================================================
@@ -1120,8 +1685,7 @@ class Struct(Construct):
     :param \*\*kw: Construct instances, list of members (requires Python 3.6)
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
-
-    bug??? KeyError
+    :raises KeyError: building a subcon but found no corresponding key in dictionary
 
     Example::
 
@@ -1179,52 +1743,62 @@ class Struct(Construct):
                 elif sc.flagbuildnone:
                     subobj = obj.get(sc.name, None)
                 else:
-                    subobj = obj[sc.name]
+                    subobj = obj[sc.name] # raises KeyError
 
                 if sc.flagembedded:
-                    context.update(subobj)
-                if sc.name:
-                    context[sc.name] = subobj
+                    if subobj is not None:
+                        context.update(subobj)
+                else:
+                    if sc.name:
+                        context[sc.name] = subobj
 
                 buildret = sc._build(subobj, stream, context, path)
                 if buildret is not None:
                     if sc.flagembedded:
                         context.update(buildret)
-                    if sc.name:
-                        context[sc.name] = buildret
+                    else:
+                        if sc.name:
+                            context[sc.name] = buildret
             except StopIteration:
                 break
         return context
 
     def _sizeof(self, context, path):
+        context = Container(_ = context)
         try:
-            def isStruct(sc):
-                return isStruct(sc.subcon) if isinstance(sc, Renamed) else isinstance(sc, Struct)
-            def nest(context, sc):
-                if isStruct(sc) and not sc.flagembedded and sc.name in context:
-                    context2 = context[sc.name]
-                    context2["_"] = context
-                    return context2
-                else:
-                    return context
-            return sum(sc._sizeof(nest(context, sc), path) for sc in self.subcons)
+            return sum(sc._sizeof(context, path) for sc in self.subcons)
         except (KeyError, AttributeError):
             raise SizeofError("cannot calculate size, key not found in context")
 
-    def _compileparse(self, code):
-        code.append("""
-            from construct import Container
-        """)
+        # try:
+        #     def isStruct(sc):
+        #         return isStruct(sc.subcon) if isinstance(sc, Renamed) else isinstance(sc, Struct)
+        #     def nest(context, sc):
+        #         if isStruct(sc) and not sc.flagembedded and sc.name in context:
+        #             context2 = context[sc.name]
+        #             context2["_"] = context
+        #             return context2
+        #         else:
+        #             return context
+        #     return sum(sc._sizeof(nest(context, sc), path) for sc in self.subcons)
+        # except (KeyError, AttributeError):
+        #     raise SizeofError("cannot calculate size, key not found in context")
+
+    def _emitparse(self, code):
         fname = "parse_struct_%s" % code.allocateId()
         block = """
-            def %s(io, context):
-                this = Container()
-                this._ = context
+            def %s(io, this):
+                this = Container(_ = this)
         """ % (fname, )
         for sc in self.subcons:
-            block += """
+            if sc.flagembedded:
+                block += """
+                this.update(%s)
+                """ % (sc._compileparse(code), )
+            else:
+                block += """
                 %s%s
-            """ % ("this.%s = " % sc.name if sc.name else "", sc._compileparse(code))
+                """ % ("this[%r] = " % sc.name if sc.name else "", sc._compileparse(code))
         block += """
                 del this._
                 return this
@@ -1249,8 +1823,7 @@ class Sequence(Struct):
     :param \*\*kw: Construct instances, list of members (requires Python 3.6)
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
-
-    bug??? KeyError
+    :raises KeyError: building a subcon but found no corresponding key in dictionary
 
     Example::
 
@@ -1292,8 +1865,10 @@ class Sequence(Struct):
                     subobj = objiter
                 else:
                     subobj = next(objiter)
+
                 if sc.name:
                     context[sc.name] = subobj
+
                 buildret = sc._build(subobj, stream, context, path)
                 if buildret is not None:
                     if sc.flagembedded:
@@ -1303,26 +1878,25 @@ class Sequence(Struct):
             except StopIteration:
                 break
 
-    def _compileparse(self, code):
-        code.append("""
-            from construct import Container, ListContainer
-        """)
+    def _emitparse(self, code):
         fname = "parse_sequence_%s" % code.allocateId()
         block = """
-            def %s(io, context):
+            def %s(io, this):
                 result = ListContainer()
+                this = Container(_ = this)
         """ % (fname,)
-        if any(sc.name for sc in self.subcons):
-            block += """
-                this = Container()
-            """
         for sc in self.subcons:
-            block += """
+            if sc.flagembedded:
+                block += """
+                result.extend(%s)
+                """ % (sc._compileparse(code))
+            else:
+                block += """
                 result.append(%s)
-            """ % (sc._compileparse(code))
+                """ % (sc._compileparse(code))
             if sc.name:
                 block += """
-                this.%s = result[-1]
+                this[%r] = result[-1]
                 """ % (sc.name, )
         block += """
                 return result
@@ -1332,15 +1906,90 @@ class Sequence(Struct):
 
 
 #===============================================================================
-# arrays and repeaters
+# arrays ranges and repeaters
 #===============================================================================
+class Array(Subconstruct):
+    r"""
+    Homogenous array of elements, similar to C# generic T[].
+
+    Parses into a ListContainer (a list). Parsing and building stops when either count items were procssed or StopIteration was raised. Builds from a list. If given list has more or less than count elements, raises RangeError. Size is defined as count multiplied by subcon size, but only if subcon is fixed size.
+
+    Operator [] can be used to make Array and Range instances (recommended).
+
+    :param count: integer or context lambda, strict amount of elements
+    :param subcon: Construct instance, subcon to process individual elements
+
+    :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
+    :raises RangeError: specified count is not valid
+    :raises RangeError: given object has different length than specified count
+
+    Can propagate any exception from the lambdas, possibly non-ConstructError.
+
+    Example::
+
+        >>> d = Array(5, Byte) or Byte[5]
+        >>> d.build(range(5))
+        b'\x00\x01\x02\x03\x04'
+        >>> d.parse(_)
+        [0, 1, 2, 3, 4]
+
+        Alternative syntax (recommended):
+        >>> Bytes[5] creates Array
+        >>> Byte[3:5], Byte[3:], Byte[:5] creates Range
+        >>> Byte[:] creates GreedyRange
+    """
+    __slots__ = ["count"]
+
+    def __init__(self, count, subcon):
+        super(Array, self).__init__(subcon)
+        self.count = count
+
+    def _parse(self, stream, context, path):
+        count = self.count
+        if callable(count):
+            count = count(context)
+        if not 0 <= count:
+            raise RangeError("invalid count %s" % (count,))
+        obj = ListContainer()
+        try:
+            for i in range(count):
+                obj.append(self.subcon._parse(stream, context, path))
+        except StopIteration:
+            pass
+        return obj
+
+    def _build(self, obj, stream, context, path):
+        count = self.count
+        if callable(count):
+            count = count(context)
+        if not 0 <= count:
+            raise RangeError("invalid count %s" % (count,))
+        if not len(obj) == count:
+            raise RangeError("expected %d elements, found %d" % (count, len(obj)))
+        try:
+            for subobj in obj:
+                self.subcon._build(subobj, stream, context, path)
+        except StopIteration:
+            pass
+
+    def _sizeof(self, context, path):
+        try:
+            count = self.count
+            if callable(count):
+                count = count(context)
+        except (KeyError, AttributeError):
+            raise SizeofError("cannot calculate size, key not found in context")
+        return count * self.subcon._sizeof(context, path)
+
+    def _emitparse(self, code):
+        return "ListContainer((%s) for i in range(%s))" % (self.subcon._compileparse(code), self.count)
+
+
 class Range(Subconstruct):
     r"""
     Homogenous array of elements, similar to C# generic T[], but works with unknown count of elements using following rules.
 
     Parses into a ListContainer (a list). Parsing stops when either max count was reached or an exception occured inside subcon. If count is less than min, raises RangeError. Builds from a list. If given list has more than max elements, raises RangeError. Size is defined as min (max) multiplied by subcon size, but only if min==max and subcon is fixed size.
-
-    nesting???
 
     Operator [] can be used to make Array and Range instances (recommended).
 
@@ -1351,6 +2000,7 @@ class Range(Subconstruct):
     :param subcon: Construct instance, subcon to process individual elements
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
+    :raises StreamError: stream is not seekable and tellable
     :raises RangeError: consumed or produced too little or too many elements, or specified min and max are not valid
     :raises NotImplementedError: compiled (unless its Array)
 
@@ -1384,13 +2034,12 @@ class Range(Subconstruct):
         min = self.min(context) if callable(self.min) else self.min
         max = self.max(context) if callable(self.max) else self.max
         if not 0 <= min <= max:
-            raise RangeError("unsane min %s and max %s" % (min, max))
+            raise RangeError("invalid min %s and max %s" % (min, max))
         obj = ListContainer()
-        context = Container(_ = context)
         try:
             while len(obj) < max:
-                fallback = stream.tell()
-                obj.append(self.subcon._parse(stream, context._, path))
+                fallback = _tell_stream(stream)
+                obj.append(self.subcon._parse(stream, context, path))
         except StopIteration:
             pass
         except ExplicitError:
@@ -1398,22 +2047,19 @@ class Range(Subconstruct):
         except Exception:
             if len(obj) < min:
                 raise RangeError("expected %d to %d elements, found %d" % (min, max, len(obj)))
-            stream.seek(fallback)
+            _seek_stream(stream, fallback)
         return obj
 
     def _build(self, obj, stream, context, path):
         min = self.min(context) if callable(self.min) else self.min
         max = self.max(context) if callable(self.max) else self.max
         if not 0 <= min <= max:
-            raise RangeError("unsane min %s and max %s" % (min, max))
-        if not isinstance(obj, collections.Sequence):
-            raise RangeError("expected sequence type, found %s" % type(obj))
+            raise RangeError("invalid min %s and max %s" % (min, max))
         if not min <= len(obj) <= max:
             raise RangeError("expected %d to %d elements, found %d" % (min, max, len(obj)))
-        context = Container(_ = context)
         try:
-            for i,subobj in enumerate(obj):
-                self.subcon._build(subobj, stream, context._, path)
+            for subobj in obj:
+                self.subcon._build(subobj, stream, context, path)
         except StopIteration:
             pass
         except ExplicitError:
@@ -1434,10 +2080,8 @@ class Range(Subconstruct):
             return min * self.subcon._sizeof(context, path)
         raise SizeofError("cannot calculate size, unless element count and size is fixed")
 
-    def _compileparse(self, code):
-        if not self.min == self.max:
-            raise NotImplementedError("Range compiles only for Array instances")
-        return "ListContainer((%s) for i in range(%s))" % (self.subcon._compileparse(code), self.max)
+    def _emitdecompiled(self, code):
+        return "Range(%s, %s, %s)" % (self.min, self.max, self.subcon._decompile(code), )
 
 
 def GreedyRange(subcon):
@@ -1460,50 +2104,23 @@ def GreedyRange(subcon):
 
         Alternative syntax (recommended):
         >>> Bytes[5] creates Array
-        >>> Byte[3:5], Byte[3:], Byte[:5] create Range
+        >>> Byte[3:5], Byte[3:], Byte[:5] creates Range
         >>> Byte[:] creates GreedyRange
     """
     return Range(0, 2**64, subcon)
-
-
-def Array(count, subcon):
-    r"""
-    Homogenous array of elements, similar to C# generic T[].
-
-    Semantics are like for Range(count, count, subcon).
-
-    :param count: integer or context lambda, strict amount of elements
-    :param subcon: Construct instance, subcon to process individual elements
-
-    See :class:`~construct.core.Range` for raisable exceptions.
-
-    Example::
-
-        >>> d = Array(5, Byte) or Byte[5]
-        >>> d.build(range(5))
-        b'\x00\x01\x02\x03\x04'
-        >>> d.parse(_)
-        [0, 1, 2, 3, 4]
-
-        Alternative syntax (recommended):
-        >>> Bytes[5] creates Array
-        >>> Byte[3:5], Byte[3:], Byte[:5] create Range
-        >>> Byte[:] creates GreedyRange
-    """
-    return Range(count, count, subcon)
 
 
 class RepeatUntil(Subconstruct):
     r"""
     Homogenous array of elements, similar to C# generic IEnumerable<T>, that repeats until the predicate indicates it to stop. Note that the last element (that predicate indicated as True) is included in the return list.
 
-    Parse iterates indefinately until last element passed the predicate. Build iterates indefinately over given list, until an element passed the precicate (or raises RangeError if no element passed it). Size is undefined.
+    Parse iterates indefinately until last element passed the predicate. Build iterates indefinately over given list, until an element passed the precicate (or raises RepeatError if no element passed it). Size is undefined.
 
     :param predicate: lambda that takes (obj, list, context) and returns True to break or False to continue (or a truthy value)
     :param subcon: Construct instance, subcon used to parse and build each element
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
-    :raises RangeError: consumed all elements but neither passed the predicate
+    :raises RepeatError: consumed all elements in the stream but neither passed the predicate
     :raises NotImplementedError: compiled
 
     Can propagate any exception from the lambda, possibly non-ConstructError.
@@ -1521,9 +2138,11 @@ class RepeatUntil(Subconstruct):
         [1, 0, 0]
     """
     __slots__ = ["predicate"]
+
     def __init__(self, predicate, subcon):
         super(RepeatUntil, self).__init__(subcon)
         self.predicate = predicate
+
     def _parse(self, stream, context, path):
         obj = ListContainer()
         while True:
@@ -1531,13 +2150,15 @@ class RepeatUntil(Subconstruct):
             obj.append(subobj)
             if self.predicate(subobj, obj, context):
                 return obj
+
     def _build(self, obj, stream, context, path):
-        for i, subobj in enumerate(obj):
+        for i,subobj in enumerate(obj):
             self.subcon._build(subobj, stream, context, path)
             if self.predicate(subobj, obj[:i+1], context):
                 break
         else:
-            raise RangeError("expected any item to match predicate, when building")
+            raise RepeatError("expected any item to match predicate, when building")
+
     def _sizeof(self, context, path):
         raise SizeofError("cannot calculate size, amount depends on actual data")
 
@@ -1561,9 +2182,13 @@ class Embedded(Subconstruct):
         >>> d.parse(b"abc")
         Container(a=97)(b=98)(c=99)
     """
+
     def __init__(self, subcon):
         super(Embedded, self).__init__(subcon)
         self.flagembedded = True
+
+    def _emitparse(self, code):
+        return self.subcon._compileparse(code)
 
 
 class Renamed(Subconstruct):
@@ -1582,9 +2207,11 @@ class Renamed(Subconstruct):
         >>> "number" / Int32ub
         <Renamed: number>
     """
+
     def __init__(self, newname, subcon):
         super(Renamed, self).__init__(subcon)
         self.name = newname
+
     def _parse(self, stream, context, path):
         try:
             path += " -> %s" % (self.name,)
@@ -1593,6 +2220,7 @@ class Renamed(Subconstruct):
             if "\n" in str(e):
                 raise
             raise e.__class__("%s\n    %s" % (e, path))
+
     def _build(self, obj, stream, context, path):
         try:
             path += " -> %s" % (self.name,)
@@ -1601,6 +2229,7 @@ class Renamed(Subconstruct):
             if "\n" in str(e):
                 raise
             raise e.__class__("%s\n    %s" % (e, path))
+
     def _sizeof(self, context, path):
         try:
             path += " -> %s" % (self.name,)
@@ -1609,7 +2238,8 @@ class Renamed(Subconstruct):
             if "\n" in str(e):
                 raise
             raise e.__class__("%s\n    %s" % (e, path))
-    def _compileparse(self, code):
+
+    def _emitparse(self, code):
         return self.subcon._compileparse(code)
 
 
@@ -1629,6 +2259,7 @@ class Const(Subconstruct):
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
     :raises ConstError: parsed data does not match specified value, or building from wrong value
+    :raises StringError: given non-bytes value, perhaps unicode
 
     Example::
 
@@ -1643,30 +2274,37 @@ class Const(Subconstruct):
         b'\xff\x00\x00\x00'
     """
     __slots__ = ["value"]
+
     def __init__(self, value, subcon=None):
         if subcon is None:
+            if not isinstance(value, bytestringtype):
+                raise StringError("given non-bytes value, perhaps unicode? %r" % (value,))
             subcon = Bytes(len(value))
         super(Const, self).__init__(subcon)
         self.value = value
         self.flagbuildnone = True
+
     def _parse(self, stream, context, path):
         obj = self.subcon._parse(stream, context, path)
         if obj != self.value:
             raise ConstError("parsing expected %r but parsed %r" % (self.value, obj))
         return obj
+
     def _build(self, obj, stream, context, path):
         if obj not in (None, self.value):
             raise ConstError("building expected None or %r but got %r" % (self.value, obj))
         return self.subcon._build(self.value, stream, context, path)
+
     def _sizeof(self, context, path):
         return self.subcon._sizeof(context, path)
-    def _compileparse(self, code):
+
+    def _emitparse(self, code):
         code.append("""
             def parse_const(value, expected):
                 assert value == expected
                 return value
         """)
-        return "parse_const(%s, %r)" % (self.subcon._compileparse(code), self.value)
+        return "parse_const(%s, %r)" % (self.subcon._compileparse(code), self.value,)
 
 
 class Computed(Construct):
@@ -1703,17 +2341,22 @@ class Computed(Construct):
         b'\x98\xc2\xec\x10\x07\xf5\x8e\x98\xc2\xec'
     """
     __slots__ = ["func"]
+
     def __init__(self, func):
         super(Computed, self).__init__()
         self.func = func
         self.flagbuildnone = True
+
     def _parse(self, stream, context, path):
         return self.func(context) if callable(self.func) else self.func
+
     def _build(self, obj, stream, context, path):
         return self.func(context) if callable(self.func) else self.func
+
     def _sizeof(self, context, path):
         return 0
-    def _compileparse(self, code):
+
+    def _emitparse(self, code):
         return "%r" % (self.func,)
 
 
@@ -1742,15 +2385,18 @@ class Rebuild(Subconstruct):
         b'\x03\x01\x02\x03'
     """
     __slots__ = ["func"]
+
     def __init__(self, subcon, func):
         super(Rebuild, self).__init__(subcon)
         self.func = func
         self.flagbuildnone = True
+
     def _build(self, obj, stream, context, path):
         obj = self.func(context) if callable(self.func) else self.func
         self.subcon._build(obj, stream, context, path)
         return obj
-    def _compileparse(self, code):
+
+    def _emitparse(self, code):
         return self.subcon._compileparse(code)
 
 
@@ -1778,15 +2424,18 @@ class Default(Subconstruct):
         b'\x00'
     """
     __slots__ = ["value"]
+
     def __init__(self, subcon, value):
         super(Default, self).__init__(subcon)
         self.value = value
         self.flagbuildnone = True
+
     def _build(self, obj, stream, context, path):
         obj = (self.value(context) if callable(self.value) else self.value) if obj is None else obj
         self.subcon._build(obj, stream, context, path)
         return obj
-    def _compileparse(self, code):
+
+    def _emitparse(self, code):
         return self.subcon._compileparse(code)
 
 
@@ -1807,26 +2456,31 @@ class Check(Construct):
         Check(lambda ctx: len(ctx.payload.data) == ctx.payload_len)
         Check(len_(this.payload.data) == this.payload_len)
     """
+
     def __init__(self, func):
         super(Check, self).__init__()
         self.func = func
         self.flagbuildnone = True
+
     def _parse(self, stream, context, path):
         passed = self.func(context) if callable(self.func) else self.func
         if not passed:
             raise ValidationError("check failed during parsing")
+
     def _build(self, obj, stream, context, path):
         passed = self.func(context) if callable(self.func) else self.func
         if not passed:
             raise ValidationError("check failed during building")
+
     def _sizeof(self, context, path):
         return 0
-    def _compileparse(self, code):
+
+    def _emitparse(self, code):
         code.append("""
             def parse_check(condition):
                 assert condition
         """)
-        return "parse_check(%r)" % (self.func)
+        return "parse_check(%r)" % (self.func,)
 
 
 @singleton
@@ -1844,14 +2498,21 @@ class Error(Construct):
         >>> d.parse(b"data...")
         construct.core.ExplicitError: Error field was activated during parsing
     """
+
     def __init__(self):
         super(self.__class__, self).__init__()
         self.flagbuildnone = True
+
     def _parse(self, stream, context, path):
         raise ExplicitError("Error field was activated during parsing")
+
     def _build(self, obj, stream, context, path):
         raise ExplicitError("Error field was activated during building")
-    def _compileparse(self, code):
+
+    def _emitdecompiled(self, code):
+        return "Error"
+
+    def _emitparse(self, code):
         code.append("""
             def parse_error():
                 assert False
@@ -1874,9 +2535,8 @@ class FocusedSeq(Construct):
     :param \*\*kw: Construct instances, list of members (requires Python 3.6)
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
-    :raises IndexError: selector does not match with members, integer out of bounds, or name not found among named members
-
-    bug???
+    :raises IndexError: selector does not match any subcon
+    :raises KeyError: selector does not match any subcon
 
     :raises NotImplementedError: compiled with non-constant selector
 
@@ -1908,9 +2568,9 @@ class FocusedSeq(Construct):
             parsebuildfrom = parsebuildfrom(context)
         if isinstance(parsebuildfrom, int):
             index = parsebuildfrom
-            self.subcons[index]  #IndexError check
+            self.subcons[index]  # raises IndexError
         if isinstance(parsebuildfrom, str):
-            index = [i for i,sc in enumerate(self.subcons) if sc.name == parsebuildfrom][0]  #IndexError check
+            index = {sc.name:i for i,sc in enumerate(self.subcons) if sc.name}[parsebuildfrom] # raises KeyError
         for i,sc in enumerate(self.subcons):
             parseret = sc._parse(stream, context, path)
             if sc.name:
@@ -1926,9 +2586,9 @@ class FocusedSeq(Construct):
             parsebuildfrom = parsebuildfrom(context)
         if isinstance(parsebuildfrom, int):
             index = parsebuildfrom
-            self.subcons[index]  #IndexError check
+            self.subcons[index]  # raises IndexError
         if isinstance(parsebuildfrom, str):
-            index = [i for i,sc in enumerate(self.subcons) if sc.name == parsebuildfrom][0]  #IndexError check
+            index = {sc.name:i for i,sc in enumerate(self.subcons) if sc.name}[parsebuildfrom] # raises KeyError
         context[index] = obj
         sc = self.subcons[index]
         if sc.name:
@@ -1945,47 +2605,33 @@ class FocusedSeq(Construct):
     def _sizeof(self, context, path):
         context = Container(_ = context)
         try:
-            parsebuildfrom = self.parsebuildfrom
-            if callable(parsebuildfrom):
-                parsebuildfrom = parsebuildfrom(context)
+            return sum(sc._sizeof(context, path) for sc in self.subcons)
         except (KeyError, AttributeError):
             raise SizeofError("cannot calculate size, key not found in context")
-        if isinstance(parsebuildfrom, int):
-            index = parsebuildfrom
-            self.subcons[index]  #IndexError check
-        if isinstance(parsebuildfrom, str):
-            index = [i for i,sc in enumerate(self.subcons) if sc.name == parsebuildfrom][0]  #IndexError check
-        return self.subcons[index]._sizeof(context, path)
 
-    def _compileparse(self, code):
+    def _emitparse(self, code):
         if callable(self.parsebuildfrom):
             raise NotImplementedError("FocusedSeq does not compile non-constant selectors")
-        code.append("""
-            from construct import Container
-        """)
         fname = "parse_focusedseq_%s" % code.allocateId()
         block = """
-            def %s(io, context):
+            def %s(io, this):
                 result = []
+                this = Container(_ = this)
         """ % (fname, )
-        if any(sc.name for sc in self.subcons):
-            block += """
-                this = Container()
-            """
         for sc in self.subcons:
             block += """
                 result.append(%s)
             """ % (sc._compileparse(code), )
             if sc.name:
                 block += """
-                this.%s = result[-1]
+                this[%r] = result[-1]
                 """ % (sc.name, )
         parsebuildfrom = self.parsebuildfrom
         if isinstance(parsebuildfrom, int):
             index = parsebuildfrom
-            self.subcons[index]  #IndexError check
+            self.subcons[index]  # raises IndexError
         if isinstance(parsebuildfrom, str):
-            index = [i for i,sc in enumerate(self.subcons) if sc.name == parsebuildfrom][0]  #IndexError check
+            index = {sc.name:i for i,sc in enumerate(self.subcons) if sc.name}[parsebuildfrom] # raises KeyError
         block += """
                 return result[%s]
         """ % (index, )
@@ -2014,16 +2660,20 @@ class Numpy(Construct):
         >>> Numpy.parse(_)
         array([1, 2, 3])
     """
+
     def __init__(self):
         super(self.__class__, self).__init__()
+
     def _parse(self, stream, context, path):
         import numpy
         return numpy.load(stream)
+
     def _build(self, obj, stream, context, path):
         import numpy
         numpy.save(stream, obj)
-    def _compileparse(self, code):
-        return code.defer("Numpy")
+
+    def _emitdecompiled(self, code):
+        return "Numpy"
 
 
 class NamedTuple(Adapter):
@@ -2034,14 +2684,12 @@ class NamedTuple(Adapter):
 
     :param tuplename: string
     :param tuplefields: string or list of strings
-    :param subcon: Construct instance, either Struct Sequence Array/Range
+    :param subcon: Construct instance, either Struct Sequence Array Range
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
-    :raises AdaptationError: subcon is neither Struct Sequence Array/Range
+    :raises AdaptationError: subcon is neither Struct Sequence Array Range
 
     Can propagate collections exceptions.
-
-    bug??? NamedTupleError
 
     Example::
 
@@ -2051,266 +2699,44 @@ class NamedTuple(Adapter):
         >>> d.parse(b"123")
         coord(x=49, y=50, z=51)
     """
+    __slots__ = ["tuplename", "tuplefields"]
+
     def __init__(self, tuplename, tuplefields, subcon):
+        if not isinstance(subcon, (Struct,Sequence,Array,Range)):
+            raise AdaptationError("subcon is neither Struct Sequence Array Range")
         super(NamedTuple, self).__init__(subcon)
         self.tuplename = tuplename
         self.tuplefields = tuplefields
         import collections
         self.factory = collections.namedtuple(tuplename, tuplefields)
+
     def _decode(self, obj, context):
-        if isinstance(obj, list):
+        # Note: Sequence happens to be also a Struct, thus ordering
+        if isinstance(self.subcon, (Sequence,Array,Range)):
             return self.factory(*obj)
-        if isinstance(obj, dict):
+        if isinstance(self.subcon, Struct):
             return self.factory(**obj)
-        raise AdaptationError("can only decode and encode from lists and dicts")
+        raise AdaptationError("subcon is neither Struct Sequence Array Range")
+
     def _encode(self, obj, context):
-        if isinstance(self.subcon, (Sequence,Range)):
+        # Note: Sequence happens to be also a Struct, thus ordering
+        if isinstance(self.subcon, (Sequence,Array,Range)):
             return list(obj)
         if isinstance(self.subcon, Struct):
             return {sc.name:getattr(obj,sc.name) for sc in self.subcon.subcons if sc.name}
-        raise AdaptationError("can only decode and encode from lists and dicts")
-    def _compileparse(self, code):
-        code.append("""
-            import collections
-        """)
-        code.append("""
-            def parse_namedtuple(value, factory):
-                if isinstance(value, list):
-                    return factory(*value)
-                if isinstance(value, dict):
-                    return factory(**value)
-                assert False
-        """)
-        tuplename = "namedtuple_%s" % code.allocateId()
+        raise AdaptationError("subcon is neither Struct Sequence Array Range")
+
+    def _emitparse(self, code):
+        fname = "factory_%s" % code.allocateId()
         code.append("""
             %s = collections.namedtuple(%r, %r)
-        """ % (tuplename, self.tuplename, self.tuplefields, ))
-        return "parse_namedtuple(%s, %s)" % (self.subcon._compileparse(code), tuplename)
-
-
-#===============================================================================
-# alignment and padding
-#===============================================================================
-def Padding(length, pattern=b"\x00"):
-    r"""
-    Appends null bytes.
-
-    Parsing consumes specified amount of bytes and discards it. Building writes specified pattern byte multiplied into specified length. Size is same as specified.
-
-    :param length: integer or context lambda, length of the padding
-    :param pattern: b-character, padding pattern, default is \\x00
-
-    :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
-    :raises PaddingError: length was negative
-
-    Can propagate any exception from the lambda, possibly non-ConstructError.
-
-    Example::
-
-        >>> d = Padding(4)
-        >>> d.build(None)
-        b'\x00\x00\x00\x00'
-        >>> d.parse(b"****")
-        None
-        >>> d.sizeof()
-        4
-    """
-    return Padded(length, Pass, pattern=pattern)
-
-
-class Padded(Subconstruct):
-    r"""
-    Appends additional null bytes to achieve a length.
-
-    Note that subcon can actually be variable size, it is the eventual amount of bytes that is read or written during parsing or building that determines actual padding.
-
-    Parsing first parses subcon, then consumes an amount of bytes to sum up to specified length, and discards it. Building first builds subcon, then writes specified pattern byte to sum up to specified length. Size is same as specified.
-
-    :param length: integer or context lambda, length of the padding
-    :param subcon: Construct instance
-    :param pattern: b-character, padding pattern, default is \\x00
-
-    :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
-    :raises PaddingError: length was negative, or subcon read or written more than the length (would cause negative pad)
-
-    Can propagate any exception from the lambda, possibly non-ConstructError.
-
-    Example::
-
-        >>> d = Padded(4, Byte)
-        >>> d.build(255)
-        b'\xff\x00\x00\x00'
-        >>> d.parse(_)
-        255
-        >>> d.sizeof()
-        4
-
-        >>> d = Padded(4, VarInt)
-        >>> d.build(1)
-        b'\x01\x00\x00\x00'
-        >>> d.build(70000)
-        b'\xf0\xa2\x04\x00'
-    """
-    __slots__ = ["length", "pattern"]
-    def __init__(self, length, subcon, pattern=b"\x00"):
-        if not isinstance(pattern, bytes) or len(pattern) != 1:
-            raise PaddingError("pattern expected to be bytes of length 1")
-        super(Padded, self).__init__(subcon)
-        self.length = length
-        self.pattern = pattern
-    def _parse(self, stream, context, path):
-        length = self.length(context) if callable(self.length) else self.length
-        position1 = stream.tell()
-        obj = self.subcon._parse(stream, context, path)
-        position2 = stream.tell()
-        padlen = length - (position2 - position1)
-        if padlen < 0:
-            raise PaddingError("subcon parsed %d bytes but was allowed only %d" % (position2-position1, length))
-        _read_stream(stream, padlen)
-        return obj
-    def _build(self, obj, stream, context, path):
-        length = self.length(context) if callable(self.length) else self.length
-        position1 = stream.tell()
-        subobj = self.subcon._build(obj, stream, context, path)
-        position2 = stream.tell()
-        padlen = length - (position2 - position1)
-        if padlen < 0:
-            raise PaddingError("subcon build %d bytes but was allowed only %d" % (position2-position1, length))
-        _write_stream(stream, padlen, self.pattern * padlen)
-        return subobj
-    def _sizeof(self, context, path):
-        try:
-            return self.length(context) if callable(self.length) else self.length
-        except (KeyError, AttributeError):
-            raise SizeofError("cannot calculate size, key not found in context")
-    def _compileparse(self, code):
-        return "[%s, read_bytes(io, %s - %s)][0]" % (self.subcon._compileparse(code), self.length, self.subcon.sizeof())
-
-
-class Aligned(Subconstruct):
-    r"""
-    Appends additional null bytes to achieve a length that is shortest multiple of a modulus.
-
-    Note that subcon can actually be variable size, it is the eventual amount of bytes that is read or written during parsing or building that determines actual padding.
-
-    Parsing first parses subcon, then consumes an amount of bytes to sum up to specified length, and discards it. Building first builds subcon, then writes specified pattern byte to sum up to specified length. Size is subcon size plus modulo remainder, unless SizeofError was raised.
-
-    :param modulus: integer or context lambda, modulus to final length
-    :param subcon: Construct instance
-    :param pattern: optional, b-character, padding pattern, default is \\x00
-
-    :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
-    :raises PaddingError: modulus was zero or negative
-
-    Can propagate any exception from the lambda, possibly non-ConstructError.
-
-    Example::
-
-        >>> d = Aligned(4, Int16ub)
-        >>> d.parse(b'\x00\x01\x00\x00')
-        1
-        >>> d.sizeof()
-        4
-    """
-    __slots__ = ["subcon", "modulus", "pattern"]
-    def __init__(self, modulus, subcon, pattern=b"\x00"):
-        if not isinstance(pattern, bytes) or len(pattern) != 1:
-            raise PaddingError("pattern expected to be bytes character")
-        super(Aligned, self).__init__(subcon)
-        self.modulus = modulus
-        self.pattern = pattern
-    def _parse(self, stream, context, path):
-        modulus = self.modulus(context) if callable(self.modulus) else self.modulus
-        position1 = stream.tell()
-        obj = self.subcon._parse(stream, context, path)
-        position2 = stream.tell()
-        pad = -(position2 - position1) % modulus
-        _read_stream(stream, pad)
-        return obj
-    def _build(self, obj, stream, context, path):
-        modulus = self.modulus(context) if callable(self.modulus) else self.modulus
-        position1 = stream.tell()
-        subobj = self.subcon._build(obj, stream, context, path)
-        position2 = stream.tell()
-        pad = -(position2 - position1) % modulus
-        _write_stream(stream, pad, self.pattern * pad)
-        return subobj
-    def _sizeof(self, context, path):
-        try:
-            modulus = self.modulus(context) if callable(self.modulus) else self.modulus
-            subconlen = self.subcon._sizeof(context, path)
-            return subconlen + (-subconlen % modulus)
-        except (KeyError, AttributeError):
-            raise SizeofError("cannot calculate size, key not found in context")
-    def _compileparse(self, code):
-        return "[%s, read_bytes(io, -%s %% %s)][0]" % (self.subcon._compileparse(code), self.subcon.sizeof(), self.modulus, )
-
-
-def AlignedStruct(modulus, *subcons, **kw):
-    r"""
-    Makes a structure where each field is aligned to the same modulus (it is a struct of aligned fields, NOT an aligned struct).
-
-    See :class:`~construct.core.Aligned` and :class:`~construct.core.Struct` for semantics and raisable exceptions.
-
-    :param modulus: integer or context lambda, passed to each member
-    :param \*subcons: Construct instances, list of members, some can be anonymous
-    :param \*\*kw: Construct instances, list of members (requires Python 3.6)
-
-    Example::
-
-        >>> d = AlignedStruct(4, "a"/Int8ub, "b"/Int16ub)
-        >>> d.build(dict(a=1,b=5))
-        b'\x01\x00\x00\x00\x00\x05\x00\x00'
-        >>> d.parse(_)
-        Container(a=1)(b=5)
-        >>> d.sizeof()
-        8
-    """
-    subcons = list(subcons) + list(k/v for k,v in kw.items())
-    return Struct(*[Aligned(modulus, sc) for sc in subcons])
-
-
-def BitStruct(*subcons):
-    r"""
-    Makes a structure inside a Bitwise.
-
-    See :class:`~construct.core.Bitwise` and :class:`~construct.core.Struct` for semantics and raisable exceptions.
-
-    :param \*subcons: Construct instances, list of members, some can be anonymous
-    :param \*\*kw: Construct instances, list of members (requires Python 3.6)
-
-    Example::
-
-        BitStruct  <-->  Bitwise(Struct(...))
-
-        >>> d = BitStruct(
-        ...     "a" / Flag,
-        ...     "b" / Nibble,
-        ...     "c" / BitsInteger(10),
-        ...     "d" / Padding(1),
-        ... )
-        >>> d.parse(b"\xbe\xef")
-        Container(a=True)(b=7)(c=887)(d=None)
-        >>> d.sizeof()
-        2
-    """
-    return Bitwise(Struct(*subcons))
-
-
-def EmbeddedBitStruct(*subcons):
-    r"""
-    Makes an embedded BitStruct.
-
-    See :class:`~construct.core.Bitwise` and :class:`~construct.core.Embedded` and :class:`~construct.core.Struct` for semantics and raisable exceptions.
-
-    :param \*subcons: Construct instances, list of members, some can be anonymous
-    :param \*\*kw: Construct instances, list of members (requires Python 3.6)
-
-    Example::
-
-        EmbeddedBitStruct  <-->  Bitwise(Embedded(Struct(...)))
-    """
-    return Bitwise(Embedded(Struct(*subcons)))
+        """ % (fname, self.tuplename, self.tuplefields, ))
+        # Note: Sequence happens to be also a Struct, thus ordering
+        if isinstance(self.subcon, (Sequence,Array,Range)):
+            return "%s(*(%s))" % (fname, self.subcon._compileparse(code), )
+        if isinstance(self.subcon, Struct):
+            return "%s(**(%s))" % (fname, self.subcon._compileparse(code), )
+        raise AdaptationError("subcon is neither Struct Sequence Array Range")
 
 
 #===============================================================================
@@ -2322,7 +2748,7 @@ class Union(Construct):
 
     :class:`~construct.core.Embedded` fields do not need to be named.
 
-    Parses subcons in sequence, and reverts the stream back to original position after each subcon. Afterwards, advances the stream by selected subcon. Builds from any subcon that has a matching key in given dict. Size is same as selected subcon.
+    Parses subcons in sequence, and reverts the stream back to original position after each subcon. Afterwards, advances the stream by selected subcon. Builds from any subcon that has a matching key in given dict. Size is undefined (because parsefrom is not used for building).
 
     This class does context nesting, meaning its members are given access to a new dictionary where the "_" entry points to the outer context. When parsing, each member gets parsed and subcon parse return value is inserted into context under matching key only if the member was named. When building, the matching entry gets inserted into context before subcon gets build, and if subcon build returns a new value (not None) that gets replaced in the context.
 
@@ -2333,9 +2759,10 @@ class Union(Construct):
     :param \*\*kw: Construct instances, list of members (requires Python 3.6)
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
+    :raises StreamError: stream is not seekable and tellable
     :raises UnionError: selector does not match any subcon, or dict given to build does not contain any keys matching any subcon
-
-    bug??? KeyError
+    :raises IndexError: selector does not match any subcon
+    :raises KeyError: selector does not match any subcon
 
     Can propagate any exception from the lambda, possibly non-ConstructError.
 
@@ -2351,16 +2778,18 @@ class Union(Construct):
         >>> Union(0, raw=Bytes(8), ints=Int32ub[2], shorts=Int16ub[4], chars=Byte[8])
     """
     __slots__ = ["subcons","parsefrom"]
+
     def __init__(self, parsefrom, *subcons, **kw):
         if isinstance(parsefrom, Construct):
             raise UnionError("parsefrom should be either: None int str context-function")
         super(Union, self).__init__()
         self.subcons = list(subcons) + list(k/v for k,v in kw.items())
         self.parsefrom = parsefrom
+
     def _parse(self, stream, context, path):
         obj = Container()
         context = Container(_ = context)
-        fallback = stream.tell()
+        fallback = _tell_stream(stream)
         forwards = {}
         for i,sc in enumerate(self.subcons):
             if sc.flagembedded:
@@ -2372,90 +2801,101 @@ class Union(Construct):
                 if sc.name:
                     obj[sc.name] = subobj
                     context[sc.name] = subobj
-            forwards[i] = stream.tell()
+            forwards[i] = _tell_stream(stream)
             if sc.name:
-                forwards[sc.name] = stream.tell()
-            stream.seek(fallback)
+                forwards[sc.name] = _tell_stream(stream)
+            _seek_stream(stream, fallback)
         parsefrom = self.parsefrom
         if callable(parsefrom):
             parsefrom = parsefrom(context)
         if parsefrom is not None:
-            stream.seek(forwards[parsefrom])
+            _seek_stream(stream, forwards[parsefrom]) # raises KeyError
         return obj
+
     def _build(self, obj, stream, context, path):
         context = Container(_ = context)
         context.update(obj)
         for sc in self.subcons:
-            if sc.flagbuildnone:
+            if sc.flagembedded:
+                subobj = obj
+            elif sc.flagbuildnone:
                 subobj = obj.get(sc.name, None)
-                buildret = sc._build(subobj, stream, context, path)
-                if buildret is not None:
-                    if sc.flagembedded:
-                        context.update(buildret)
-                    if sc.name:
-                        context[sc.name] = buildret
-                return buildret
             elif sc.name in obj:
-                context[sc.name] = obj[sc.name]
-                buildret = sc._build(obj[sc.name], stream, context, path)
-                if buildret is not None:
-                    if sc.flagembedded:
-                        context.update(buildret)
+                subobj = obj[sc.name]
+            else:
+                continue
+
+            if sc.flagembedded:
+                if subobj is not None:
+                    context.update(subobj)
+            else:
+                if sc.name:
+                    context[sc.name] = subobj
+
+            buildret = sc._build(subobj, stream, context, path)
+            if buildret is not None:
+                if sc.flagembedded:
+                    context.update(buildret)
+                else:
                     if sc.name:
                         context[sc.name] = buildret
-                return buildret
+            return buildret
         else:
-            raise UnionError("cannot build, none of subcons %s were found in the dictionary %s" % ([sc.name for sc in self.subcons], obj))
+            raise UnionError("cannot build, none of subcons were found in the dictionary %r" % (obj, ))
+
     def _sizeof(self, context, path):
-        parsefrom = self.parsefrom
-        try:
-            if callable(parsefrom):
-                parsefrom = parsefrom(context)
-        except (KeyError, AttributeError):
-            raise SizeofError("cannot calculate size, key not found in context")
-        if parsefrom is None:
-            raise SizeofError("cannot calculate size, parsefrom is None")
-        if isinstance(parsefrom, int):
-            sc = self.subcons[parsefrom]
-            return sc._sizeof(context, path)
-        if isinstance(parsefrom, str):
-            sc = {sc.name:sc for sc in self.subcons if sc.name}[parsefrom]
-            return sc._sizeof(context, path)
-        raise UnionError("parsefrom should be either: None int str context-function")
-    def _compileparse(self, code):
+        raise SizeofError("Union builds depending on actual object dict, size is unknown")
+
+    def _emitparse(self, code):
         if callable(self.parsefrom):
             raise NotImplementedError("Union does not compile non-constant parsefrom")
-        code.append("""
-            from construct import Container
-        """)
         fname = "parse_union_%s" % code.allocateId()
         block = """
-            def %s(io, context):
-                this = Container()
+            def %s(io, this):
+                this = Container(_ = this)
                 fallback = io.tell()
         """ % (fname, )
-        index = -1
+        if isinstance(self.parsefrom, type(None)):
+            index = -1
+            skipfallback = False
+            skipforward = True
         if isinstance(self.parsefrom, int):
             index = self.parsefrom
+            self.subcons[index] # raises IndexError
+            skipfallback = True
+            skipforward = self.subcons[index].sizeof() == self.subcons[-1].sizeof()
         if isinstance(self.parsefrom, str):
-            index = {sc.name:i for i,sc in enumerate(self.subcons) if sc.name}[self.parsefrom]
+            index = {sc.name:i for i,sc in enumerate(self.subcons) if sc.name}[self.parsefrom] # raises KeyError
+            skipfallback = True
+            skipforward = self.subcons[index].sizeof() == self.subcons[-1].sizeof()
+
         for i,sc in enumerate(self.subcons):
-            block += """
+            if sc.flagembedded:
+                block += """
+                this.update(%s)
+                """ % (sc._compileparse(code), )
+            else:
+                block += """
                 %s%s
-            """ % ("this.%s = " % sc.name if sc.name else "", sc._compileparse(code))
-            if i == index:
+                """ % ("this[%r] = " % sc.name if sc.name else "", sc._compileparse(code))
+            if i == index and not skipforward:
                 block += """
                 forward = io.tell()
                 """
-            if i < len(self.subcons)-1 or index == -1:
+            if i < len(self.subcons)-1:
                 block += """
                 io.seek(fallback)
                 """
-        if index != -1:
+        if not skipfallback:
+            block += """
+                io.seek(fallback)
+            """
+        if not skipforward:
             block += """
                 io.seek(forward)
             """
         block += """
+                del this._
                 return this
         """
         code.append(block)
@@ -2473,6 +2913,7 @@ class Select(Construct):
     :param includename: indicates whether to include name of selected subcon in the return value of parsing, default is False
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
+    :raises StreamError: stream is not seekable and tellable
     :raises SelectError: neither subcon succeded when parsing or building
 
     Example::
@@ -2487,24 +2928,27 @@ class Select(Construct):
         >>> Select(num=Int32ub, text=CString(encoding="utf8"))
     """
     __slots__ = ["subcons", "includename"]
+
     def __init__(self, *subcons, **kw):
         super(Select, self).__init__()
         self.subcons = list(subcons) + list(k/v for k,v in kw.items() if k != "includename")
         self.flagbuildnone = all(sc.flagbuildnone for sc in self.subcons)
         self.flagembedded = all(sc.flagembedded for sc in self.subcons)
         self.includename = kw.pop("includename", False)
+
     def _parse(self, stream, context, path):
         for sc in self.subcons:
-            fallback = stream.tell()
+            fallback = _tell_stream(stream)
             try:
                 obj = sc._parse(stream, context, path)
             except ExplicitError:
                 raise
             except ConstructError:
-                stream.seek(fallback)
+                _seek_stream(stream, fallback)
             else:
                 return (sc.name,obj) if self.includename else obj
         raise SelectError("no subconstruct matched")
+
     def _build(self, obj, stream, context, path):
         if self.includename:
             name, obj = obj
@@ -2550,15 +2994,13 @@ def Optional(subcon):
     return Select(subcon, Pass)
 
 
-def If(predicate, subcon):
+def If(condfunc, subcon):
     r"""
     If-then conditional construct.
 
-    Parsing evaluates condition, if True then subcon is parsed, otherwise just returns None. Building also evaluates condition, if True then subcon gets build from, otherwise does nothing. Size is undefined.
+    Parsing evaluates condition, if True then subcon is parsed, otherwise just returns None. Building also evaluates condition, if True then subcon gets build from, otherwise does nothing. Size is either same as subcon or 0, depending how condfunc evaluates.
 
-    wrong??? size is Switch sizeof?
-
-    :param predicate: bool or context lambda (or a truthy value)
+    :param condfunc: bool or context lambda (or a truthy value)
     :param subcon: Construct instance, used if condition indicates True
 
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
@@ -2567,7 +3009,7 @@ def If(predicate, subcon):
 
     Example::
 
-        If  <-->  IfThenElse(predicate, subcon, Pass)
+        If <--> IfThenElse(condfunc, subcon, Pass)
 
         >>> d = If(this.x > 0, Byte)
         >>> d.build(255, x=1)
@@ -2575,19 +3017,17 @@ def If(predicate, subcon):
         >>> d.build(255, x=0)
         b''
     """
-    return IfThenElse(predicate, subcon, Pass)
+    return IfThenElse(condfunc, subcon, Pass)
 
 
-def IfThenElse(predicate, thensubcon, elsesubcon):
+def IfThenElse(condfunc, thensubcon, elsesubcon):
     r"""
     If-then-else conditional construct, similar to ternary operator.
 
     Parsing and building evaluates condition, and defers to either subcon depending on the value.
     Size is computed the same way.
 
-    wrong??? size is Switch sizeof?
-
-    :param predicate: bool or context lambda (or a truthy value)
+    :param condfunc: bool or context lambda (or a truthy value)
     :param thensubcon: Construct instance, used if condition indicates True
     :param elsesubcon: Construct instance, used if condition indicates False
 
@@ -2604,12 +3044,12 @@ def IfThenElse(predicate, thensubcon, elsesubcon):
         b'\xff'
     """
     macro = Switch(
-        lambda ctx: bool(predicate(ctx)) if callable(predicate) else bool(predicate),
+        lambda ctx: bool(condfunc(ctx)) if callable(condfunc) else bool(condfunc),
         {True:thensubcon, False:elsesubcon},
     )
-    def _compileparse(self, code):
-        return "(%s if %s else %s)" % (thensubcon._compileparse(code), predicate, elsesubcon._compileparse(code), )
-    return CompilableMacro(macro, _compileparse)
+    def _emitparse(self, code):
+        return "(%s) if (%s) else (%s)" % (thensubcon._compileparse(code), condfunc, elsesubcon._compileparse(code), )
+    return CompilableMacro(macro, _emitparse)
 
 
 class Switch(Construct):
@@ -2649,6 +3089,7 @@ class Switch(Construct):
             raise SwitchError("no default case defined, sizeof failed")
 
     __slots__ = ["subcons", "keyfunc", "cases", "default", "includekey"]
+
     def __init__(self, keyfunc, cases, default=NoDefault, includekey=False):
         super(Switch, self).__init__()
         self.keyfunc = keyfunc
@@ -2660,10 +3101,12 @@ class Switch(Construct):
             allcases.append(default)
         self.flagbuildnone = all(sc.flagbuildnone for sc in allcases)
         self.flagembedded = all(sc.flagembedded for sc in allcases)
+
     def _parse(self, stream, context, path):
         key = self.keyfunc(context) if callable(self.keyfunc) else self.keyfunc
         obj = self.cases.get(key, self.default)._parse(stream, context, path)
         return (key,obj) if self.includekey else obj
+
     def _build(self, obj, stream, context, path):
         if self.includekey:
             key,obj = obj
@@ -2671,6 +3114,7 @@ class Switch(Construct):
             key = self.keyfunc(context) if callable(self.keyfunc) else self.keyfunc
         case = self.cases.get(key, self.default)
         return case._build(obj, stream, context, path)
+
     def _sizeof(self, context, path):
         try:
             key = self.keyfunc(context) if callable(self.keyfunc) else self.keyfunc
@@ -2682,7 +3126,7 @@ class Switch(Construct):
 
 class StopIf(Construct):
     r"""
-    Checks for a condition, and stops Struct Sequence Range from parsing or building further.
+    Checks for a condition, and stops certain classes (Struct Sequence Range FocusedSeq) from parsing or building further.
 
     Parsing and building check the condition, and raise StopIteration if indicated. Size is not defined.
 
@@ -2698,18 +3142,281 @@ class StopIf(Construct):
         >>> Sequence('x'/Byte, StopIf(this.x == 0), 'y'/Byte)
         >>> GreedyRange(FocusedSeq(0, 'x'/Byte, StopIf(this.x == 0)))
     """
+
     def __init__(self, condfunc):
         super(StopIf, self).__init__()
         self.condfunc = condfunc
         self.flagbuildnone = True
+
     def _parse(self, stream, context, path):
-        if self.condfunc(context):
+        condfunc = self.condfunc
+        if callable(condfunc):
+            condfunc = condfunc(context)
+        if condfunc:
             raise StopIteration
+
     def _build(self, obj, stream, context, path):
-        if self.condfunc(context):
-            raise StopIteration
+        if self.includename:
+            name, obj = obj
+            for sc in self.subcons:
+                if sc.name == name:
+                    return sc._build(obj, stream, context, path)
+        else:
+            for sc in self.subcons:
+                try:
+                    data = sc.build(obj, **context)
+                except ExplicitError:
+                    raise
+                except Exception:
+                    pass
+                else:
+                    _write_stream(stream, len(data), data)
+                    return
+        raise SelectError("no subconstruct matched: %s" % (obj,))
+
+
+#===============================================================================
+# alignment and padding
+#===============================================================================
+def Padding(length, pattern=b"\x00"):
+    r"""
+    Appends null bytes.
+
+    Parsing consumes specified amount of bytes and discards it. Building writes specified pattern byte multiplied into specified length. Size is same as specified.
+
+    :param length: integer or context lambda, length of the padding
+    :param pattern: b-character, padding pattern, default is \\x00
+
+    :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
+    :raises PaddingError: length was negative
+    :raises PaddingError: pattern was not bytes (b-character)
+
+    Can propagate any exception from the lambda, possibly non-ConstructError.
+
+    Example::
+
+        >>> d = Padding(4)
+        >>> d.build(None)
+        b'\x00\x00\x00\x00'
+        >>> d.parse(b"****")
+        None
+        >>> d.sizeof()
+        4
+    """
+    return Padded(length, Pass, pattern=pattern)
+
+
+class Padded(Subconstruct):
+    r"""
+    Appends additional null bytes to achieve a length.
+
+    Note that subcon can actually be variable size, it is the eventual amount of bytes that is read or written during parsing or building that determines actual padding.
+
+    Parsing first parses subcon, then consumes an amount of bytes to sum up to specified length, and discards it. Building first builds subcon, then writes specified pattern byte to sum up to specified length. Size is same as specified.
+
+    :param length: integer or context lambda, length of the padding
+    :param subcon: Construct instance
+    :param pattern: b-character, padding pattern, default is \\x00
+
+    :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
+    :raises PaddingError: length was negative, or subcon read or written more than the length (would cause negative pad)
+    :raises PaddingError: pattern was not bytes (b-character)
+
+    Can propagate any exception from the lambda, possibly non-ConstructError.
+
+    Example::
+
+        >>> d = Padded(4, Byte)
+        >>> d.build(255)
+        b'\xff\x00\x00\x00'
+        >>> d.parse(_)
+        255
+        >>> d.sizeof()
+        4
+
+        >>> d = Padded(4, VarInt)
+        >>> d.build(1)
+        b'\x01\x00\x00\x00'
+        >>> d.build(70000)
+        b'\xf0\xa2\x04\x00'
+    """
+    __slots__ = ["length", "pattern"]
+
+    def __init__(self, length, subcon, pattern=b"\x00"):
+        if not isinstance(pattern, bytes) or len(pattern) != 1:
+            raise PaddingError("pattern expected to be bytes of length 1")
+        super(Padded, self).__init__(subcon)
+        self.length = length
+        self.pattern = pattern
+
+    def _parse(self, stream, context, path):
+        length = self.length(context) if callable(self.length) else self.length
+        position1 = _tell_stream(stream)
+        obj = self.subcon._parse(stream, context, path)
+        position2 = _tell_stream(stream)
+        padlen = length - (position2 - position1)
+        if padlen < 0:
+            raise PaddingError("subcon parsed %d bytes but was allowed only %d" % (position2-position1, length))
+        _read_stream(stream, padlen)
+        return obj
+
+    def _build(self, obj, stream, context, path):
+        length = self.length(context) if callable(self.length) else self.length
+        position1 = _tell_stream(stream)
+        subobj = self.subcon._build(obj, stream, context, path)
+        position2 = _tell_stream(stream)
+        padlen = length - (position2 - position1)
+        if padlen < 0:
+            raise PaddingError("subcon build %d bytes but was allowed only %d" % (position2-position1, length))
+        _write_stream(stream, padlen, self.pattern * padlen)
+        return subobj
+
     def _sizeof(self, context, path):
-        return SizeofError("StopIf cannot determine size because it depends on actual context which then depends on actual data and outer constructs")
+        try:
+            return self.length(context) if callable(self.length) else self.length
+        except (KeyError, AttributeError):
+            raise SizeofError("cannot calculate size, key not found in context")
+
+    def _emitparse(self, code):
+        return "(%s, read_bytes(io, %s - %s))[0]" % (self.subcon._compileparse(code), self.length, self.subcon.sizeof())
+
+
+class Aligned(Subconstruct):
+    r"""
+    Appends additional null bytes to achieve a length that is shortest multiple of a modulus.
+
+    Note that subcon can actually be variable size, it is the eventual amount of bytes that is read or written during parsing or building that determines actual padding.
+
+    Parsing first parses subcon, then consumes an amount of bytes to sum up to specified length, and discards it. Building first builds subcon, then writes specified pattern byte to sum up to specified length. Size is subcon size plus modulo remainder, unless SizeofError was raised.
+
+    :param modulus: integer or context lambda, modulus to final length
+    :param subcon: Construct instance
+    :param pattern: optional, b-character, padding pattern, default is \\x00
+
+    :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
+    :raises PaddingError: modulus was less than 2
+    :raises PaddingError: pattern was not bytes (b-character)
+
+    Can propagate any exception from the lambda, possibly non-ConstructError.
+
+    Example::
+
+        >>> d = Aligned(4, Int16ub)
+        >>> d.parse(b'\x00\x01\x00\x00')
+        1
+        >>> d.sizeof()
+        4
+    """
+    __slots__ = ["subcon", "modulus", "pattern"]
+
+    def __init__(self, modulus, subcon, pattern=b"\x00"):
+        if not isinstance(pattern, bytes) or len(pattern) != 1:
+            raise PaddingError("pattern expected to be bytes character")
+        super(Aligned, self).__init__(subcon)
+        self.modulus = modulus
+        self.pattern = pattern
+
+    def _parse(self, stream, context, path):
+        modulus = self.modulus(context) if callable(self.modulus) else self.modulus
+        if modulus < 2:
+            raise PaddingError("expected modulo 2 or greater")
+        position1 = _tell_stream(stream)
+        obj = self.subcon._parse(stream, context, path)
+        position2 = _tell_stream(stream)
+        pad = -(position2 - position1) % modulus
+        _read_stream(stream, pad)
+        return obj
+
+    def _build(self, obj, stream, context, path):
+        modulus = self.modulus(context) if callable(self.modulus) else self.modulus
+        if modulus < 2:
+            raise PaddingError("expected modulo 2 or greater")
+        position1 = _tell_stream(stream)
+        subobj = self.subcon._build(obj, stream, context, path)
+        position2 = _tell_stream(stream)
+        pad = -(position2 - position1) % modulus
+        _write_stream(stream, pad, self.pattern * pad)
+        return subobj
+
+    def _sizeof(self, context, path):
+        try:
+            modulus = self.modulus(context) if callable(self.modulus) else self.modulus
+            if modulus < 2:
+                raise PaddingError("expected modulo 2 or greater")
+            subconlen = self.subcon._sizeof(context, path)
+            return subconlen + (-subconlen % modulus)
+        except (KeyError, AttributeError):
+            raise SizeofError("cannot calculate size, key not found in context")
+
+    def _emitparse(self, code):
+        return "(%s, read_bytes(io, -%s %% %s))[0]" % (self.subcon._compileparse(code), self.subcon.sizeof(), self.modulus, )
+
+
+def AlignedStruct(modulus, *subcons, **kw):
+    r"""
+    Makes a structure where each field is aligned to the same modulus (it is a struct of aligned fields, NOT an aligned struct).
+
+    See :class:`~construct.core.Aligned` and :class:`~construct.core.Struct` for semantics and raisable exceptions.
+
+    :param modulus: integer or context lambda, passed to each member
+    :param \*subcons: Construct instances, list of members, some can be anonymous
+    :param \*\*kw: Construct instances, list of members (requires Python 3.6)
+
+    Example::
+
+        >>> d = AlignedStruct(4, "a"/Int8ub, "b"/Int16ub)
+        >>> d.build(dict(a=1,b=5))
+        b'\x01\x00\x00\x00\x00\x05\x00\x00'
+        >>> d.parse(_)
+        Container(a=1)(b=5)
+        >>> d.sizeof()
+        8
+    """
+    subcons = list(subcons) + list(k/v for k,v in kw.items())
+    return Struct(*[Aligned(modulus, sc) for sc in subcons])
+
+
+def BitStruct(*subcons, **kw):
+    r"""
+    Makes a structure inside a Bitwise.
+
+    See :class:`~construct.core.Bitwise` and :class:`~construct.core.Struct` for semantics and raisable exceptions.
+
+    :param \*subcons: Construct instances, list of members, some can be anonymous
+    :param \*\*kw: Construct instances, list of members (requires Python 3.6)
+
+    Example::
+
+        BitStruct  <-->  Bitwise(Struct(...))
+
+        >>> d = BitStruct(
+        ...     "a" / Flag,
+        ...     "b" / Nibble,
+        ...     "c" / BitsInteger(10),
+        ...     "d" / Padding(1),
+        ... )
+        >>> d.parse(b"\xbe\xef")
+        Container(a=True)(b=7)(c=887)(d=None)
+        >>> d.sizeof()
+        2
+    """
+    return Bitwise(Struct(*subcons, **kw))
+
+
+def EmbeddedBitStruct(*subcons, **kw):
+    r"""
+    Makes an embedded BitStruct.
+
+    See :class:`~construct.core.Bitwise` and :class:`~construct.core.Embedded` and :class:`~construct.core.Struct` for semantics and raisable exceptions.
+
+    :param \*subcons: Construct instances, list of members, some can be anonymous
+    :param \*\*kw: Construct instances, list of members (requires Python 3.6)
+
+    Example::
+
+        EmbeddedBitStruct  <-->  Embedded(Bitwise(Struct(...)))
+    """
+    return Embedded(Bitwise(Struct(*subcons, **kw)))
 
 
 #===============================================================================
@@ -2729,8 +3436,6 @@ class Pointer(Subconstruct):
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
     :raises StreamError: stream is not seekable and tellable
 
-    bug???
-
     Can propagate any exception from the lambda, possibly non-ConstructError.
 
     Example::
@@ -2742,23 +3447,27 @@ class Pointer(Subconstruct):
         b'\x00\x00\x00\x00\x00\x00\x00\x00Z'
     """
     __slots__ = ["offset"]
+
     def __init__(self, offset, subcon):
         super(Pointer, self).__init__(subcon)
         self.offset = offset
+
     def _parse(self, stream, context, path):
         offset = self.offset(context) if callable(self.offset) else self.offset
-        fallback = stream.tell()
-        stream.seek(offset, 2 if offset < 0 else 0)
+        fallback = _tell_stream(stream)
+        _seek_stream(stream, offset, 2 if offset < 0 else 0)
         obj = self.subcon._parse(stream, context, path)
-        stream.seek(fallback)
+        _seek_stream(stream, fallback)
         return obj
+
     def _build(self, obj, stream, context, path):
         offset = self.offset(context) if callable(self.offset) else self.offset
-        fallback = stream.tell()
-        stream.seek(offset, 2 if offset < 0 else 0)
+        fallback = _tell_stream(stream)
+        _seek_stream(stream, offset, 2 if offset < 0 else 0)
         buildret = self.subcon._build(obj, stream, context, path)
-        stream.seek(fallback)
+        _seek_stream(stream, fallback)
         return buildret
+
     def _sizeof(self, context, path):
         raise SizeofError
 
@@ -2776,8 +3485,6 @@ class Peek(Subconstruct):
     :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
     :raises StreamError: stream is not seekable and tellable
 
-    bug???
-
     Example::
 
         >>> d = Sequence(Peek(Int8ub), Peek(Int16ub))
@@ -2786,11 +3493,13 @@ class Peek(Subconstruct):
         >>> d.sizeof()
         0
     """
+
     def __init__(self, subcon):
         super(Peek, self).__init__(subcon)
         self.flagbuildnone = True
+
     def _parse(self, stream, context, path):
-        fallback = stream.tell()
+        fallback = _tell_stream(stream)
         try:
             return self.subcon._parse(stream, context, path)
         except ExplicitError:
@@ -2798,9 +3507,11 @@ class Peek(Subconstruct):
         except ConstructError:
             pass
         finally:
-            stream.seek(fallback)
+            _seek_stream(stream, fallback)
+
     def _build(self, obj, stream, context, path):
         pass
+
     def _sizeof(self, context, path):
         return 0
 
@@ -2818,8 +3529,6 @@ class Seek(Construct):
 
     :raises StreamError: stream is not seekable
 
-    bug???
-
     Can propagate any exception from the lambda, possibly non-ConstructError.
 
     Example::
@@ -2833,22 +3542,27 @@ class Seek(Construct):
         b'01234\xff6789'
     """
     __slots__ = ["at", "whence"]
+
     def __init__(self, at, whence=0):
         super(Seek, self).__init__()
         self.at = at
         self.whence = whence
         self.flagbuildnone = True
+
     def _parse(self, stream, context, path):
         at = self.at(context) if callable(self.at) else self.at
         whence = self.whence(context) if callable(self.whence) else self.whence
-        return stream.seek(at, whence)
+        return _seek_stream(stream, at, whence)
+
     def _build(self, obj, stream, context, path):
         at = self.at(context) if callable(self.at) else self.at
         whence = self.whence(context) if callable(self.whence) else self.whence
-        return stream.seek(at, whence)
+        return _seek_stream(stream, at, whence)
+
     def _sizeof(self, context, path):
         raise SizeofError("Seek only moves the stream, size is not meaningful")
-    def _compileparse(self, code):
+
+    def _emitparse(self, code):
         return "io.seek(%s, %s)" % (self.at, self.whence, )
 
 
@@ -2863,8 +3577,6 @@ class Tell(Construct):
 
     :raises StreamError: stream is not tellable
 
-    bug???
-
     Example::
 
         >>> d = Struct("num"/VarInt, "offset"/Tell)
@@ -2873,16 +3585,21 @@ class Tell(Construct):
         >>> d.build(dict(num=88))
         b'X'
     """
+
     def __init__(self):
         super(self.__class__, self).__init__()
         self.flagbuildnone = True
+
     def _parse(self, stream, context, path):
-        return stream.tell()
+        return _tell_stream(stream)
+
     def _build(self, obj, stream, context, path):
-        return stream.tell()
+        return _tell_stream(stream)
+
     def _sizeof(self, context, path):
         return 0
-    def _compileparse(self, code):
+
+    def _emitparse(self, code):
         return "io.tell()"
 
 
@@ -2902,16 +3619,24 @@ class Pass(Construct):
         >>> Pass.sizeof()
         0
     """
+
     def __init__(self):
         super(self.__class__, self).__init__()
         self.flagbuildnone = True
+
     def _parse(self, stream, context, path):
         return None
+
     def _build(self, obj, stream, context, path):
         pass
+
     def _sizeof(self, context, path):
         return 0
-    def _compileparse(self, code):
+
+    def _emitdecompiled(self, code):
+        return "Pass"
+
+    def _emitparse(self, code):
         return "None"
 
 
@@ -2931,9 +3656,11 @@ class Terminated(Construct):
         >>> Terminated.parse(b"remaining")
         construct.core.TerminatedError: expected end of stream
     """
+
     def __init__(self):
         super(self.__class__, self).__init__()
         self.flagbuildnone = True
+
     def _parse(self, stream, context, path):
         try:
             if stream.read(1):
@@ -2941,12 +3668,15 @@ class Terminated(Construct):
         except IOError:
             # Restreamed.read(1) does not return empty string like BytesIO
             pass
+
     def _build(self, obj, stream, context, path):
         pass
+
     def _sizeof(self, context, path):
         return 0
-    def _compileparse(self, code):
-        return code.defer("Terminated")
+
+    def _emitdecompiled(self, code):
+        return "Terminated"
 
 
 class Restreamed(Subconstruct):
@@ -2957,7 +3687,7 @@ class Restreamed(Subconstruct):
 
     .. warning:: Remember that subcon must consume or produce an amount of bytes that is a multiple of encoding or decoding units. For example, in a Bitwise context you should process a multiple of 8 bits or the stream will fail during parsing/building.
 
-    .. warning:: Do NOT use pointers inside Restreamed context.
+    .. warning:: Do NOT use seeking/telling classes inside Restreamed context.
 
     :param subcon: Construct instance, subcon which will operate on the buffer
     :param encoder: function that takes bytes and returns bytes (used when building)
@@ -2966,34 +3696,37 @@ class Restreamed(Subconstruct):
     :param decoderunit: integer ratio, decoder takes that many bytes at once
     :param sizecomputer: function that computes amount of bytes outputed
 
-    raises???
-
     Can propagate any exception from the lambda, possibly non-ConstructError.
+
+    Can also raise arbitrary exceptions in its implementation.
 
     Example::
 
         Bitwise  <--> Restreamed(subcon, bits2bytes, 8, bytes2bits, 1, lambda n: n//8)
         Bytewise <--> Restreamed(subcon, bytes2bits, 1, bits2bytes, 8, lambda n: n*8)
     """
+    __slots__ = ["decoder", "decoderunit", "encoder", "encoderunit", "sizecomputer"]
 
-    __slots__ = ["sizecomputer", "encoder", "encoderunit", "decoder", "decoderunit"]
-    def __init__(self, subcon, encoder, encoderunit, decoder, decoderunit, sizecomputer):
+    def __init__(self, subcon, decoder, decoderunit, encoder, encoderunit, sizecomputer):
         super(Restreamed, self).__init__(subcon)
-        self.encoder = encoder
-        self.encoderunit = encoderunit
         self.decoder = decoder
         self.decoderunit = decoderunit
+        self.encoder = encoder
+        self.encoderunit = encoderunit
         self.sizecomputer = sizecomputer
+
     def _parse(self, stream, context, path):
-        stream2 = RestreamedBytesIO(stream, self.encoder, self.encoderunit, self.decoder, self.decoderunit)
+        stream2 = RestreamedBytesIO(stream, self.decoder, self.decoderunit, self.encoder, self.encoderunit)
         obj = self.subcon._parse(stream2, context, path)
         stream2.close()
         return obj
+
     def _build(self, obj, stream, context, path):
-        stream2 = RestreamedBytesIO(stream, self.encoder, self.encoderunit, self.decoder, self.decoderunit)
+        stream2 = RestreamedBytesIO(stream, self.decoder, self.decoderunit, self.encoder, self.encoderunit)
         buildret = self.subcon._build(obj, stream2, context, path)
         stream2.close()
         return buildret
+
     def _sizeof(self, context, path):
         if self.sizecomputer is None:
             raise SizeofError("Restreamed cannot calculate size without a sizecomputer")
@@ -3010,26 +3743,29 @@ class Rebuffered(Subconstruct):
     :param subcon: Construct instance, subcon which will operate on the buffered stream
     :param tailcutoff: optional, integer, amount of bytes kept in buffer, by default buffers everything
 
-    raises???
+    Can also raise arbitrary exceptions in its implementation.
 
     Example::
 
         Rebuffered(..., tailcutoff=1024).parse_stream(nonseekable_stream)
     """
     __slots__ = ["stream2", "tailcutoff"]
+
     def __init__(self, subcon, tailcutoff=None):
         super(Rebuffered, self).__init__(subcon)
         self.stream2 = RebufferedBytesIO(None, tailcutoff=tailcutoff)
+
     def _parse(self, stream, context, path):
         self.stream2.substream = stream
         return self.subcon._parse(self.stream2, context, path)
+
     def _build(self, obj, stream, context, path):
         self.stream2.substream = stream
         return self.subcon._build(obj, self.stream2, context, path)
 
 
 #===============================================================================
-# tunneling and swapping
+# tunneling and byte/bit swapping
 #===============================================================================
 class RawCopy(Subconstruct):
     r"""
@@ -3041,10 +3777,8 @@ class RawCopy(Subconstruct):
 
     :param subcon: Construct instance
 
-    :raises ConstructError: building and neither data or value was given
     :raises StreamError: stream is not seekable and tellable
-
-    bug??? no RawCopyError yet
+    :raises RawCopyError: building and neither data or value was given
 
     Example::
 
@@ -3056,30 +3790,35 @@ class RawCopy(Subconstruct):
         >>> d.build(dict(value=255))
         '\xff'
     """
+
     def _parse(self, stream, context, path):
-        offset1 = stream.tell()
+        offset1 = _tell_stream(stream)
         obj = self.subcon._parse(stream, context, path)
-        offset2 = stream.tell()
-        stream.seek(offset1)
+        offset2 = _tell_stream(stream)
+        _seek_stream(stream, offset1)
         data = _read_stream(stream, offset2-offset1)
         return Container(data=data, value=obj, offset1=offset1, offset2=offset2, length=(offset2-offset1))
+
     def _build(self, obj, stream, context, path):
         if 'data' in obj:
             data = obj['data']
-            offset1 = stream.tell()
+            offset1 = _tell_stream(stream)
             _write_stream(stream, len(data), data)
-            offset2 = stream.tell()
+            offset2 = _tell_stream(stream)
             return Container(obj, data=data, offset1=offset1, offset2=offset2, length=len(data))
         if 'value' in obj:
             value = obj['value']
-            offset1 = stream.tell()
+            offset1 = _tell_stream(stream)
             ret = self.subcon._build(value, stream, context, path)
             value = value if ret is None else ret
-            offset2 = stream.tell()
-            stream.seek(offset1)
+            offset2 = _tell_stream(stream)
+            _seek_stream(stream, offset1)
             data = _read_stream(stream, offset2-offset1)
             return Container(obj, data=data, value=value, offset1=offset1, offset2=offset2, length=(offset2-offset1))
-        raise ConstructError('RawCopy cannot build, both data and value keys are missing')
+        raise RawCopyError('RawCopy cannot build, both data and value keys are missing')
+
+    def _emitdecompiled(self, code):
+        return "RawCopy(%s)" % (self.subcon._decompile(code), )
 
 
 def ByteSwapped(subcon):
@@ -3100,9 +3839,9 @@ def ByteSwapped(subcon):
         lambda s: s[::-1], subcon.sizeof(),
         lambda s: s[::-1], subcon.sizeof(),
         lambda n: n)
-    def _compileparse(self, code):
+    def _emitparse(self, code):
         return "restream(read_bytes(io, %s)[::-1], lambda io: %s)" % (subcon.sizeof(), subcon._compileparse(code), )
-    return CompilableMacro(macro, _compileparse)
+    return CompilableMacro(macro, _emitparse)
 
 
 def BitsSwapped(subcon):
@@ -3123,10 +3862,13 @@ def BitsSwapped(subcon):
         >>>> BitsSwapped(d).parse(b"\x01")
         '\x01\x00\x00\x00\x00\x00\x00\x00'
     """
-    return Restreamed(subcon,
-        lambda s: bits2bytes(bytes2bits(s)[::-1]), 1,
-        lambda s: bits2bytes(bytes2bits(s)[::-1]), 1,
+    macro = Restreamed(subcon,
+        lambda s: swapbits(s), 1,
+        lambda s: swapbits(s), 1,
         lambda n: n)
+    def _emitparse(self, code):
+        return "restream(swapbits(read_bytes(io, %s)), lambda io: %s)" % (subcon.sizeof(), subcon._compileparse(code), )
+    return CompilableMacro(macro, _emitparse)
 
 
 class Prefixed(Subconstruct):
@@ -3155,16 +3897,19 @@ class Prefixed(Subconstruct):
         [1684234849, 1751606885]
     """
     __slots__ = ["name", "lengthfield", "subcon", "includelength"]
+
     def __init__(self, lengthfield, subcon, includelength=False):
         super(Prefixed, self).__init__(subcon)
         self.lengthfield = lengthfield
         self.includelength = includelength
+
     def _parse(self, stream, context, path):
         length = self.lengthfield._parse(stream, context, path)
         if self.includelength:
             length -= self.lengthfield._sizeof(context, path)
         stream2 = io.BytesIO(_read_stream(stream, length))
         return self.subcon._parse(stream2, context, path)
+
     def _build(self, obj, stream, context, path):
         stream2 = io.BytesIO()
         obj = self.subcon._build(obj, stream2, context, path)
@@ -3175,9 +3920,11 @@ class Prefixed(Subconstruct):
         self.lengthfield._build(length, stream, context, path)
         _write_stream(stream, len(data), data)
         return obj
+
     def _sizeof(self, context, path):
         return self.lengthfield._sizeof(context, path) + self.subcon._sizeof(context, path)
-    def _compileparse(self, code):
+
+    def _emitparse(self, code):
         if self.includelength:
             raise NotImplementedError("Prefixed does not compile with includelength")
         return "restream(read_bytes(io, %s), lambda io: %s)" % (self.lengthfield._compileparse(code), self.subcon._compileparse(code), )
@@ -3205,9 +3952,41 @@ def PrefixedArray(lengthfield, subcon):
         "count" / Rebuild(lengthfield, len_(this.items)),
         "items" / subcon[this.count],
     )
-    def _compileparse(self, code):
+    def _emitparse(self, code):
         return "ListContainer((%s) for i in range(%s))" % (subcon._compileparse(code), lengthfield._compileparse(code), )
-    return CompilableMacro(macro, _compileparse)
+    return CompilableMacro(macro, _emitparse)
+
+
+class RestreamData(Subconstruct):
+    """
+    Parses a field on external data.
+
+    Parsing defers to subcon, but provides it a separate stream based on bytes data provided by datafunc (a bytes literal or context lambda). Building and sizeof are deferred to subcon.
+
+    :param datafunc: bytes or context lambda, provides data for subcon to parse
+    :param subcon: Construct instance, subcon used for storing the value
+
+    Can propagate any exception from the lambdas, possibly non-ConstructError.
+
+    Example::
+
+        >>> RestreamData(b"\xff", Byte).parse(b"")
+        255
+    """
+    __slots__ = ["datafunc"]
+    def __init__(self, datafunc, subcon):
+        super(RestreamData, self).__init__(subcon)
+        self.datafunc = datafunc
+
+    def _parse(self, stream, context, path):
+        data = self.datafunc
+        if callable(data):
+            data = data(context)
+        stream2 = io.BytesIO(data)
+        return self.subcon._parse(stream2, context, path)
+
+    def _emitparse(self, code):
+        return "restream(%r, lambda io: %s)" % (self.datafunc, self.subcon._compileparse(code), )
 
 
 class Checksum(Construct):
@@ -3238,12 +4017,14 @@ class Checksum(Construct):
         -> b'\x01\x02\xbd\xd8\x1a\xb23\xbc\xebj\xd23\xcd'...
     """
     __slots__ = ["checksumfield", "hashfunc", "bytesfunc"]
+
     def __init__(self, checksumfield, hashfunc, bytesfunc):
         super(Checksum, self).__init__()
         self.checksumfield = checksumfield
         self.hashfunc = hashfunc
         self.bytesfunc = bytesfunc
         self.flagbuildnone = True
+
     def _parse(self, stream, context, path):
         hash1 = self.checksumfield._parse(stream, context, path)
         hash2 = self.hashfunc(self.bytesfunc(context))
@@ -3252,10 +4033,12 @@ class Checksum(Construct):
                 hash1 if not isinstance(hash1,bytes) else binascii.hexlify(hash1),
                 hash2 if not isinstance(hash2,bytes) else binascii.hexlify(hash2), ))
         return hash1
+
     def _build(self, obj, stream, context, path):
         hash2 = self.hashfunc(self.bytesfunc(context))
         self.checksumfield._build(hash2, stream, context, path)
         return hash2
+
     def _sizeof(self, context, path):
         return self.checksumfield._sizeof(context, path)
 
@@ -3268,6 +4051,7 @@ class Compressed(Tunnel):
     :param encoding: string, any of module names like zlib/gzip/bzip2/lzma, otherwise any of codecs module bytes<->bytes encodings, each codec usually requires some Python version
     :param level: optional, integer between 0..9, although lzma discards it, some encoders allow different compression levels
 
+    :raises StreamError: stream failed when reading until EOF
     :raises ImportError: needed module could not be imported by ctor
 
     Example::
@@ -3278,6 +4062,7 @@ class Compressed(Tunnel):
 
    """
     __slots__ = ["encoding", "level", "lib"]
+
     def __init__(self, subcon, encoding, level=None):
         super(Compressed, self).__init__(subcon)
         self.encoding = encoding
@@ -3297,10 +4082,12 @@ class Compressed(Tunnel):
         else:
             import codecs
             self.lib = codecs
+
     def _decode(self, data, context):
         if self.encoding in ("zlib", "gzip", "bzip2", "lzma"):
             return self.lib.decompress(data)
         return self.lib.decode(data, self.encoding)
+
     def _encode(self, data, context):
         if self.encoding in ("zlib", "gzip", "bzip2", "lzma"):
             if self.level is None or self.encoding == "lzma":
@@ -3320,6 +4107,8 @@ class LazyStruct(Construct):
     .. note:: For performance, if entire struct is fixed size then entire parsing is only one stream seek.
 
     .. warning:: Members that depend on earlier (named) context entries do not work properly, because since this class is lazy, there is no guarantee that previous members were parsed and put into context dictionary.
+
+    :raises StreamError: stream is not seekable and tellable
     """
     __slots__ = ["subcons", "offsetmap", "totalsize", "subsizes", "keys"]
     def __init__(self, *subcons, **kw):
@@ -3352,14 +4141,14 @@ class LazyStruct(Construct):
 
     def _parse(self, stream, context, path):
         if self.offsetmap is not None:
-            position = stream.tell()
-            stream.seek(self.totalsize, 1)
+            position = _tell_stream(stream)
+            _seek_stream(stream, self.totalsize, 1)
             return LazyContainer(self.keys, self.offsetmap, {}, stream, position, context)
         context = Container(_ = context)
         offsetmap = {}
         keys = Container()
         values = {}
-        position = stream.tell()
+        position = _tell_stream(stream)
         for (sc,size) in zip(self.subcons, self.subsizes):
             if sc.flagembedded:
                 subobj = list(sc._parse(stream, context, path).items())
@@ -3375,8 +4164,8 @@ class LazyStruct(Construct):
             else:
                 if sc.name:
                     keys[sc.name] = None
-                    offsetmap[sc.name] = (stream.tell(), sc)
-                stream.seek(size, 1)
+                    offsetmap[sc.name] = (_tell_stream(stream), sc)
+                _seek_stream(stream, size, 1)
         return LazyContainer(list(keys.keys()), offsetmap, values, stream, 0, context)
 
     def _build(self, obj, stream, context, path):
@@ -3404,11 +4193,101 @@ class LazyStruct(Construct):
             raise SizeofError("cannot calculate size, not all members are fixed size")
 
 
+class LazySequence(Construct):
+    r"""
+    Equivalent to :class:`~construct.core.Sequence` regarding semantics, however fixed size members are parsed on demand, others are parsed immediately.
+
+    .. note:: For performance, if entire sequence is fixed size then entire parsing is only one stream seek.
+
+    .. warning:: Members that depend on earlier (named) context entries do not work properly, because since this class is lazy, there is no guarantee that previous members were parsed and put into context dictionary.
+
+    :raises StreamError: stream is not seekable and tellable
+    """
+    __slots__ = ["subcons", "offsetmap", "totalsize", "subsizes"]
+    def __init__(self, *subcons, **kw):
+        super(LazySequence, self).__init__()
+        self.subcons = list(subcons) + list(k/v for k,v in kw.items())
+
+        try:
+            self.offsetmap = {}
+            at = 0
+            for i,sc in enumerate(self.subcons):
+                if sc.flagembedded:
+                    raise SizeofError
+                self.offsetmap[i] = (at, sc)
+                at += sc.sizeof()
+            self.totalsize = at
+        except SizeofError:
+            self.offsetmap = None
+            self.totalsize = None
+
+        self.subsizes = []
+        for sc in self.subcons:
+            try:
+                self.subsizes.append(sc.sizeof())
+            except SizeofError:
+                self.subsizes.append(None)
+
+    def _parse(self, stream, context, path):
+        context = Container(_ = context)
+        if self.totalsize is not None:
+            position = _tell_stream(stream)
+            _seek_stream(stream, self.totalsize, 1)
+            return LazySequenceContainer(len(self.subcons), self.offsetmap, {}, stream, position, context)
+        offsetmap = {}
+        values = {}
+        i = 0
+        for sc,size in zip(self.subcons, self.subsizes):
+            if sc.flagembedded:
+                subobj = list(sc._parse(stream, context, path))
+                for e in subobj:
+                    values[i] = e
+                    context[i] = e
+                    i += 1
+            elif size is None:
+                obj = sc._parse(stream, context, path)
+                values[i] = obj
+                context[i] = obj
+                i += 1
+            else:
+                offsetmap[i] = (_tell_stream(stream), sc)
+                _seek_stream(stream, size, 1)
+                i += 1
+        return LazySequenceContainer(i, offsetmap, values, stream, 0, context)
+
+    def _build(self, obj, stream, context, path):
+        context = Container(_ = context)
+        objiter = iter(obj)
+        for i,sc in enumerate(self.subcons):
+            if sc.flagembedded:
+                subobj = objiter
+            else:
+                subobj = next(objiter)
+                if sc.name:
+                    context[sc.name] = subobj
+            context[i] = subobj
+            buildret = sc._build(subobj, stream, context, path)
+            if buildret is not None:
+                if sc.flagembedded:
+                    context.update(buildret)
+                if sc.name:
+                    context[sc.name] = buildret
+                context[i] = buildret
+
+    def _sizeof(self, context, path):
+        if self.totalsize is not None:
+            return self.totalsize
+        else:
+            raise SizeofError("cannot calculate size, not all members are fixed size")
+
+
 class LazyRange(Construct):
     r"""
     Equivalent to :class:`~construct.core.Range` regarding semantics, however fixed size members are parsed on demand, others are parsed immediately.
 
     .. note:: Works only with fixed size subcon. Performance wise, entire parse is essentially one stream seek.
+
+    :raises StreamError: stream is not seekable and tellable
     """
     __slots__ = ["subcon", "min", "max", "subsize"]
     def __init__(self, min, max, subcon):
@@ -3423,13 +4302,13 @@ class LazyRange(Construct):
         currentmax = self.max(context) if callable(self.max) else self.max
         if not 0 <= currentmin <= currentmax:
             raise RangeError("unsane min %s and max %s" % (currentmin, currentmax))
-        starts = stream.tell()
-        ends = stream.seek(0,2)
+        starts = _tell_stream(stream)
+        ends = _seek_stream(stream, 0, 2)
         remaining = ends - starts
         objcount = min(remaining//self.subsize, currentmax)
         if objcount < currentmin:
             raise RangeError("not enough bytes %d to read the min %d of %d bytes each" % (remaining, currentmin, self.subsize))
-        stream.seek(starts + objcount*self.subsize, 0)
+        _seek_stream(stream, starts + objcount*self.subsize, 0)
         return LazyRangeContainer(self.subcon, self.subsize, objcount, stream, starts, context)
 
     def _build(self, obj, stream, context, path):
@@ -3463,92 +4342,6 @@ class LazyRange(Construct):
             raise SizeofError("cannot calculate size, key not found in context")
 
 
-class LazySequence(Construct):
-    r"""
-    Equivalent to :class:`~construct.core.Sequence` regarding semantics, however fixed size members are parsed on demand, others are parsed immediately.
-
-    .. note:: For performance, if entire sequence is fixed size then entire parsing is only one stream seek.
-
-    .. warning:: Members that depend on earlier (named) context entries do not work properly, because since this class is lazy, there is no guarantee that previous members were parsed and put into context dictionary.
-    """
-    __slots__ = ["subcons", "offsetmap", "totalsize", "subsizes"]
-    def __init__(self, *subcons, **kw):
-        super(LazySequence, self).__init__()
-        self.subcons = list(subcons) + list(k/v for k,v in kw.items())
-
-        try:
-            self.offsetmap = {}
-            at = 0
-            for i,sc in enumerate(self.subcons):
-                if sc.flagembedded:
-                    raise SizeofError
-                self.offsetmap[i] = (at, sc)
-                at += sc.sizeof()
-            self.totalsize = at
-        except SizeofError:
-            self.offsetmap = None
-            self.totalsize = None
-
-        self.subsizes = []
-        for sc in self.subcons:
-            try:
-                self.subsizes.append(sc.sizeof())
-            except SizeofError:
-                self.subsizes.append(None)
-
-    def _parse(self, stream, context, path):
-        context = Container(_ = context)
-        if self.totalsize is not None:
-            position = stream.tell()
-            stream.seek(self.totalsize, 1)
-            return LazySequenceContainer(len(self.subcons), self.offsetmap, {}, stream, position, context)
-        offsetmap = {}
-        values = {}
-        i = 0
-        for sc,size in zip(self.subcons, self.subsizes):
-            if sc.flagembedded:
-                subobj = list(sc._parse(stream, context, path))
-                for e in subobj:
-                    values[i] = e
-                    context[i] = e
-                    i += 1
-            elif size is None:
-                obj = sc._parse(stream, context, path)
-                values[i] = obj
-                context[i] = obj
-                i += 1
-            else:
-                offsetmap[i] = (stream.tell(), sc)
-                stream.seek(size, 1)
-                i += 1
-        return LazySequenceContainer(i, offsetmap, values, stream, 0, context)
-
-    def _build(self, obj, stream, context, path):
-        context = Container(_ = context)
-        objiter = iter(obj)
-        for i,sc in enumerate(self.subcons):
-            if sc.flagembedded:
-                subobj = objiter
-            else:
-                subobj = next(objiter)
-                if sc.name:
-                    context[sc.name] = subobj
-            context[i] = subobj
-            buildret = sc._build(subobj, stream, context, path)
-            if buildret is not None:
-                if sc.flagembedded:
-                    context.update(buildret)
-                if sc.name:
-                    context[sc.name] = buildret
-                context[i] = buildret
-
-    def _sizeof(self, context, path):
-        if self.totalsize is not None:
-            return self.totalsize
-        else:
-            raise SizeofError("cannot calculate size, not all members are fixed size")
-
-
 class OnDemand(Subconstruct):
     r"""
     Allows for lazy parsing of one field.
@@ -3558,6 +4351,8 @@ class OnDemand(Subconstruct):
     .. note:: Works only with fixed size subcon.
 
     :param subcon: Construct instance, must be fixed size
+
+    :raises StreamError: stream is not seekable and tellable
 
     Example::
 
@@ -3576,19 +4371,21 @@ class OnDemand(Subconstruct):
         >>> d.build(_)
         b'\xff'
     """
+
     def _parse(self, stream, context, path):
-        offset = stream.tell()
-        stream.seek(self.subcon._sizeof(context, path), 1)
+        offset = _tell_stream(stream)
+        _seek_stream(stream, self.subcon._sizeof(context, path), 1)
         cache = {}
         def effectuate():
             if not cache:
-                fallback = stream.tell()
-                stream.seek(offset)
+                fallback = _tell_stream(stream)
+                _seek_stream(stream, offset)
                 obj = self.subcon._parse(stream, context, path)
-                stream.seek(fallback)
+                _seek_stream(stream, fallback)
                 cache["value"] = obj
             return cache["value"]
         return effectuate
+
     def _build(self, obj, stream, context, path):
         obj = obj() if callable(obj) else obj
         return self.subcon._build(obj, stream, context, path)
@@ -3620,211 +4417,22 @@ class LazyBound(Construct):
                     next = None
     """
     __slots__ = ["subconfunc"]
+
     def __init__(self, subconfunc):
         super(LazyBound, self).__init__()
         self.subconfunc = subconfunc
+
     def _parse(self, stream, context, path):
         return self.subconfunc(context)._parse(stream, context, path)
+
     def _build(self, obj, stream, context, path):
         return self.subconfunc(context)._build(obj, stream, context, path)
+
     def _sizeof(self, context, path):
         try:
             return self.subconfunc(context)._sizeof(context, path)
         except (KeyError, AttributeError):
             raise SizeofError("cannot calculate size, key not found in context")
-
-
-#===============================================================================
-# mappings
-#===============================================================================
-class Mapping(Adapter):
-    r"""
-    Adapter that maps objects to other objects. Translates objects before parsing and before building.
-
-    .. note:: It used to be used internally by Flag IfThenElse etc but became deprecated.
-
-    :param subcon: Construct instance, subcon to map to/from
-    :param decoding: dict, for decoding (parsing) mapping
-    :param encoding: dict, for encoding (building) mapping
-    :param decdefault: object, default return value when object is not found in the mapping, if no object is given then exception is raised, if ``Pass`` is used, the unmapped object is passed as-is
-    :param encdefault: object, default return value when object is not found in the mapping, if no object is given then exception is raised, if ``Pass`` is used, the unmapped object is passed as-is
-
-    Example::
-
-        ???
-    """
-    __slots__ = ["encoding", "decoding", "encdefault", "decdefault"]
-    def __init__(self, subcon, decoding, encoding, decdefault=NotImplemented, encdefault=NotImplemented):
-        super(Mapping, self).__init__(subcon)
-        self.decoding = decoding
-        self.encoding = encoding
-        self.decdefault = decdefault
-        self.encdefault = encdefault
-    def _encode(self, obj, context):
-        try:
-            return self.encoding[obj]
-        except (KeyError, TypeError):
-            if self.encdefault is NotImplemented:
-                raise MappingError("building failed, no encoding mapping for %r" % (obj,))
-            if self.encdefault is Pass:
-                return obj
-            return self.encdefault
-    def _decode(self, obj, context):
-        try:
-            return self.decoding[obj]
-        except (KeyError, TypeError):
-            if self.decdefault is NotImplemented:
-                raise MappingError("parsing failed, no decoding mapping for %r" % (obj,))
-            if self.decdefault is Pass:
-                return obj
-            return self.decdefault
-
-
-def SymmetricMapping(subcon, mapping, default=NotImplemented):
-    r"""
-    Defines a symmetric mapping, same mapping is used on parsing and building.
-
-    This is just a macro around :class:`~construct.core.Mapping`.
-
-    :param subcon: Construct instance, subcon to map to/from
-    :param mapping: dict, for decoding (parsing) mapping
-    :param default: object, default return value when object is not found in the mapping, if no object is given then exception is raised, if ``Pass`` is used, the unmapped object is passed as-is
-
-    Example::
-
-        ???
-    """
-    return Mapping(subcon,
-        encoding = mapping,
-        decoding = dict((v,k) for k,v in mapping.items()),
-        encdefault = default,
-        decdefault = default,
-    )
-
-
-@singleton
-class Flag(Construct):
-    r"""
-    One byte (or one bit) field that maps to True or False. Other non-zero bytes are also considered True. Size is defined as 1.
-
-    :raises StreamError: requested reading negative amount, could not read enough bytes, requested writing different amount than actual data, or could not write all bytes
-
-    Example::
-
-        >>> Flag.parse(b"\x01")
-        True
-        >>> Flag.build(True)
-        b'\x01'
-    """
-    def _parse(self, stream, context, path):
-        return _read_stream(stream, 1) != b"\x00"
-    def _build(self, obj, stream, context, path):
-        _write_stream(stream, 1, b"\x01" if obj else b"\x00")
-    def _sizeof(self, context, path):
-        return 1
-    def _compileparse(self, code):
-        return "(read_bytes(io, 1) != b'\\x00')"
-
-
-class Enum(Subconstruct):
-    r"""
-    Translates unicode label names to subcon values, and vice versa. 
-
-    semantics???
-    Size is same as subcon, unless it raises SizeofError.
-
-    :param subcon: Construct instance, subcon to map to/from
-    :param default: optional, keyword-only argument that specifies the default value to use when an unknown label gets build, can overlap with some existing label, if ``Pass`` then parsing returns "default" label and building skips stream
-    :param \*\*mapping: dict, mapping string names to values
-
-    :raises MappingError: label (during building) or value (during parsing) cannot be translated, and no default was provided
-
-    Example::
-
-        >>> d = Enum(Byte, zero=0, one=1)
-        >>> d.parse(b"\x01")
-        'one'
-        >>> d.parse(b"\xff")
-        construct.core.MappingError: no decoding mapping for 255
-        >>> d.build("one")
-        b'\x01'
-        >>> d.build(1)
-        b'\x01'
-    """
-    __slots__ = ["default", "encmapping", "decmapping"]
-    def __init__(self, subcon, default=NotImplemented, **mapping):
-        super(Enum, self).__init__(subcon)
-        self.default = default
-        self.encmapping =      {k:v for k,v in mapping.items()}
-        self.encmapping.update({v:v for k,v in mapping.items()})
-        self.decmapping =      {v:k for k,v in mapping.items()}
-        self.decmapping.update({k:k for k,v in mapping.items()})
-        if self.default is not NotImplemented and self.default is not Pass:
-            if True:
-                self.decmapping.update({"default":default})
-            if default not in self.decmapping:
-                self.decmapping.update({default:"default"})
-    def _parse(self, stream, context, path):
-        obj2 = self.subcon._parse(stream, context, path)
-        try:
-            obj = self.decmapping[obj2]
-        except KeyError:
-            if self.default is NotImplemented:
-                raise MappingError("parsing failed, no mapping for %r, no default either" % (obj2,))
-            if self.default is Pass:
-                return "default"
-            return "default"
-        return obj
-    def _build(self, obj, stream, context, path):
-        try:
-            obj2 = self.encmapping[obj]
-        except KeyError:
-            if self.default is NotImplemented:
-                raise MappingError("building failed, no mapping for %r, no default either" % (obj,))
-            if self.default is Pass:
-                return
-            obj = "default"
-            obj2 = self.default
-        self.subcon._build(obj2, stream, context, path)
-        return obj
-
-
-class FlagsEnum(Adapter):
-    r"""
-    Translates unicode label names to subcon integer (sub)values, and vice versa.
-
-    semantics???
-    Size is same as subcon, unless it raises SizeofError.
-
-    :param subcon: Construct instance, must operate on integers
-    :param \*\*flags: dict, mapping string names to integer values
-
-    Example::
-
-        >>> d = FlagsEnum(Byte, a=1, b=2, c=4, d=8)
-        >>> d.parse(b"\x03")
-        Container(c=False)(b=True)(a=True)(d=False)
-    """
-    __slots__ = ["flags"]
-    def __init__(self, subcon, **flags):
-        super(FlagsEnum, self).__init__(subcon)
-        self.flags = flags
-    def _encode(self, obj, context):
-        try:
-            flags = 0
-            for name,value in obj.items():
-                if value:
-                    flags |= self.flags[name]
-            return flags
-        except AttributeError:
-            raise MappingError("building failed, object is not a dictionary: %r" % (obj,))
-        except KeyError:
-            raise MappingError("building failed, unknown flag: %s" % (name,))
-    def _decode(self, obj, context):
-        obj2 = FlagsContainer()
-        for name,value in self.flags.items():
-            obj2[name] = bool(obj & value)
-        return obj2
 
 
 #===============================================================================
@@ -3845,12 +4453,12 @@ class ExprAdapter(Adapter):
             encoder = lambda x,ctx: x+1,
             decoder = lambda x,ctx: x-1 )
     """
-    __slots__ = ["_encode", "_decode"]
-    def __init__(self, subcon, encoder, decoder):
+    __slots__ = ["_decode","_encode"]
+    def __init__(self, subcon, decoder, encoder):
         super(ExprAdapter, self).__init__(subcon)
         ident = lambda obj,ctx: obj
-        self._encode = encoder if callable(encoder) else ident
         self._decode = decoder if callable(decoder) else ident
+        self._encode = encoder if callable(encoder) else ident
 
 
 class ExprSymmetricAdapter(ExprAdapter):
@@ -3870,8 +4478,8 @@ class ExprSymmetricAdapter(ExprAdapter):
     def __init__(self, subcon, encoder):
         super(ExprAdapter, self).__init__(subcon)
         ident = lambda obj,ctx: obj
+        self._decode = encoder if callable(encoder) else ident
         self._encode = encoder if callable(encoder) else ident
-        self._decode = self._encode
 
 
 class ExprValidator(Validator):
@@ -3895,9 +4503,7 @@ def OneOf(subcon, valids):
     r"""
     Validates that the object is one of the listed values, both during parsing and building.
 
-    .. note:: For performance, it attempts to convert valids into a set, but if items are not hashable, it reverts to using original collection.
-
-    implement???
+    .. note:: For performance, you should provide a set/frozenset but if items are not hashable, then a list would work the same, just slower.
 
     :param subcon: Construct instance, subcon to validate
     :param valids: collection implementing __contains__, usually a list or set
@@ -3919,9 +4525,7 @@ def NoneOf(subcon, invalids):
     r"""
     Validates that the object is none of the listed values, both during parsing and building.
 
-    .. note:: For performance, it attempts to convert valids into a set, but if items are not hashable, it reverts to using original collection.
-
-    implement???
+    .. note:: For performance, you should provide a set/frozenset but if items are not hashable, then a list would work the same, just slower.
 
     :param subcon: Construct instance, subcon to validate
     :param invalids: collection implementing __contains__, usually a list or set
@@ -3975,6 +4579,8 @@ class Slicing(Adapter):
         self.stop = stop
         self.step = step
         self.empty = empty
+    def _decode(self, obj, context):
+        return obj[self.start:self.stop:self.step]
     def _encode(self, obj, context):
         if self.start is None:
             return obj
@@ -3985,8 +4591,6 @@ class Slicing(Adapter):
             output = [self.empty] * self.count
             output[self.start:self.stop:self.step] = obj
         return output
-    def _decode(self, obj, context):
-        return obj[self.start:self.stop:self.step]
 
 
 class Indexing(Adapter):
@@ -4008,12 +4612,12 @@ class Indexing(Adapter):
         self.count = count
         self.index = index
         self.empty = empty
+    def _decode(self, obj, context):
+        return obj[self.index]
     def _encode(self, obj, context):
         output = [self.empty] * self.count
         output[self.index] = obj
         return output
-    def _decode(self, obj, context):
-        return obj[self.index]
 
 
 def Hex(subcon):
@@ -4029,8 +4633,8 @@ def Hex(subcon):
         b'\x01\x02\x03\x04'
     """
     return ExprAdapter(subcon,
+        decoder = lambda obj,ctx: None if obj is None else binascii.hexlify(obj),
         encoder = lambda obj,ctx: None if subcon.flagbuildnone else binascii.unhexlify(obj),
-        decoder = lambda obj,ctx: binascii.hexlify(obj),
     )
 
 
@@ -4047,229 +4651,9 @@ def HexDump(subcon, linesize=16):
         '0000   31 32 33 34 35 61 62 63 3b 2f                     12345abc;/       \n'
     """
     return ExprAdapter(subcon,
+        decoder = lambda obj,ctx: None if obj is None else hexdump(obj, linesize=linesize),
         encoder = lambda obj,ctx: None if subcon.flagbuildnone else hexundump(obj, linesize=linesize),
-        decoder = lambda obj,ctx: hexdump(obj, linesize=linesize),
     )
-
-
-#===============================================================================
-# strings
-#===============================================================================
-globalstringencoding = None
-
-
-def setglobalstringencoding(encoding):
-    r"""
-    Sets the encoding globally for all String PascalString CString GreedyString instances, but an encoding specified expiciltly in a particular construct supersedes it.
-
-    :param encoding: string like "utf8", or None (disable global override)
-    """
-    global globalstringencoding
-    globalstringencoding = encoding
-
-
-class StringEncoded(Adapter):
-    """Used internally."""
-    __slots__ = ["encoding"]
-    def __init__(self, subcon, encoding):
-        super(StringEncoded, self).__init__(subcon)
-        self.encoding = encoding
-    def _decode(self, obj, context):
-        encoding = self.encoding or globalstringencoding
-        if encoding:
-            obj = obj.decode(encoding)
-        return obj
-    def _encode(self, obj, context):
-        encoding = self.encoding or globalstringencoding
-        if encoding:
-            obj = obj.encode(encoding)
-        if not isinstance(obj, bytestringtype):
-            raise StringError("encoding must result in bytes type")
-        return obj
-    def _compileparse(self, code):
-        encoding = self.encoding or globalstringencoding
-        return "(%s).decode(%r)" % (self.subcon._compileparse(code), encoding, ) if encoding else "%s" % (self.subcon._compileparse(code), )
-
-
-class StringPaddedTrimmed(Adapter):
-    """Used internally."""
-    __slots__ = ["length", "padchar", "paddir", "trimdir"]
-    def __init__(self, length, subcon, padchar=b"\x00", paddir="right", trimdir="right"):
-        if not isinstance(padchar, bytestringtype) or len(padchar) != 1:
-            raise StringError("padchar must be b-string character")
-        if paddir not in ["right","left","center"]:
-            raise StringError("paddir must be one of: right left center")
-        if trimdir not in ["right","left"]:
-            raise StringError("trimdir must be one of: right left")
-        super(StringPaddedTrimmed, self).__init__(subcon)
-        self.length = length
-        self.padchar = padchar
-        self.paddir = paddir
-        self.trimdir = trimdir
-    def _decode(self, obj, context):
-        if self.paddir == "right":
-            obj = obj.rstrip(self.padchar)
-        if self.paddir == "left":
-            obj = obj.lstrip(self.padchar)
-        if self.paddir == "center":
-            obj = obj.strip(self.padchar)
-        return obj
-    def _encode(self, obj, context):
-        length = self.length(context) if callable(self.length) else self.length
-        if self.paddir == "right":
-            obj = obj.ljust(length, self.padchar[0:1])
-        if self.paddir == "left":
-            obj = obj.rjust(length, self.padchar[0:1])
-        if self.paddir == "center":
-            obj = obj.center(length, self.padchar[0:1])
-        if len(obj) > length:
-            if self.trimdir == "right":
-                obj = obj[:length]
-            if self.trimdir == "left":
-                obj = obj[-length:]
-        return obj
-    def _compileparse(self, code):
-        if self.paddir == "right":
-            func = "rstrip"
-        if self.paddir == "left":
-            func = "lstrip"
-        if self.paddir == "center":
-            func = "strip"
-        return "(%s).%s(%r)" % (self.subcon._compileparse(code), func, self.padchar)
-
-
-def String(length, encoding=None, padchar=b"\x00", paddir="right", trimdir="right"):
-    r"""
-    Configurable, fixed-length or variable-length string field.
-
-    When parsing, the byte string is stripped of byte character (as specified) from the direction (as specified) then decoded (as specified). Length is an integer or context lambda.
-    When building, the string is encoded (as specified) then padded (as specified) from the direction (as specified) or trimmed (as specified).
-    Size is same as length parameter.
-
-    The padding character and direction must be specified for padding to work. The trim direction must be specified for trimming to work.
-
-    If encoding is not specified, it works with bytes (not unicode strings).
-
-    .. warning:: Do not use >1 byte encodings like UTF16 or UTF32 with String and CString classes. This a known bug that has something to do with the fact that library inherently works with bytes (not codepoints) and codepoint-to-byte conversions are too tricky.
-
-    :param length: integer or context lambda, length in bytes (not unicode characters)
-    :param encoding: string for encoding like "utf8", or None for bytes
-    :param padchar: bytes character to pad out strings, by default b"\\x00"
-    :param paddir: string, direction to pad out strings (one of: right left both)
-    :param trimdir: string, direction to trim strings (one of: right left)
-
-    :raises StringError: building a unicode string but no encoding
-    :raises StringError: padchar paddir trimdir are not valid
-
-    Can propagate any exception from the lambda, possibly non-ConstructError.
-
-    Example::
-
-        >>> d = String(10)
-        >>> d.build(b"hello")
-        b'hello\x00\x00\x00\x00\x00'
-        >>> d.parse(_)
-        b'hello'
-        >>> d.sizeof()
-        10
-
-        >>> d = String(10, encoding="utf8")
-        >>> d.build(u"Афон")
-        b'\xd0\x90\xd1\x84\xd0\xbe\xd0\xbd\x00\x00'
-        >>> d.parse(_)
-        u'Афон'
-
-        >>> d = String(10, padchar=b"XYZ", paddir="center")
-        >>> d.build(b"abc")
-        b'XXXabcXXXX'
-        >>> d.parse(b"XYZabcXYZY")
-        b'abc'
-
-        >>> d = String(10, trimdir="right")
-        >>> d.build(b"12345678901234567890")
-        b'1234567890'
-    """
-    return StringEncoded(
-        StringPaddedTrimmed(length, Bytes(length), padchar, paddir, trimdir),
-        encoding)
-
-
-def PascalString(lengthfield, encoding=None):
-    r"""
-    Length-prefixed string. The length field can be variable length (such as VarInt) or fixed length (such as Int64ub). VarInt is recommended for new designs. Stored length is in bytes, not characters.
-
-    Size is not defined.
-
-    .. note:: Encodings like UTF16 or UTF32 work fine with PascalString.
-
-    :param lengthfield: Construct instance, field used to parse and build the length (likw VarInt Int64ub)
-    :param encoding: string for encoding like "utf8", or None for bytes
-
-    :raises StringError: building a unicode string but no encoding
-
-    Example::
-
-        >>> d = PascalString(VarInt, encoding="utf8")
-        >>> d.build(u"Афон")
-        b'\x08\xd0\x90\xd1\x84\xd0\xbe\xd0\xbd'
-        >>> d.parse(_)
-        u'Афон'
-    """
-    return StringEncoded(Prefixed(lengthfield, GreedyBytes), encoding)
-
-
-def CString(terminators=b"\x00", encoding=None):
-    r"""
-    String ending in a terminating null byte (or bytes in case of UTF16 UTF32).
-
-    reimplement???
-
-    By default, the terminator is the \\x00 byte character. Terminators field can be a longer bytes, and any one of the characters breaks parsing. First terminator byte is used when building.
-
-    .. warning:: Do not use >1 byte encodings like UTF16 or UTF32 with String and CString classes. This a known bug that has something to do with the fact that library inherently works with bytes (not codepoints) and codepoint-to-byte conversions are too tricky.
-
-    :param terminators: ??? sequence of valid terminators, first is used when building, all are used when parsing
-    :param encoding: string for encoding like "utf8", or None for bytes
-
-    :raises StringError: building a unicode string but no encoding
-
-    Example::
-
-        >>> d = CString(encoding="utf8")
-        >>> d.build(u"Афон")
-        b'\xd0\x90\xd1\x84\xd0\xbe\xd0\xbd\x00'
-        >>> d.parse(_)
-        u'Афон'
-    """
-    return StringEncoded(
-        ExprAdapter(
-            RepeatUntil(lambda obj,lst,ctx: int2byte(obj) in terminators, Byte),
-            encoder = lambda obj,ctx: iterateints(obj+terminators),
-            decoder = lambda obj,ctx: b''.join(int2byte(c) for c in obj[:-1])),
-        encoding)
-
-
-def GreedyString(encoding=None):
-    r"""
-    String that reads entire stream until EOF, and writes a given string as-is. If no encoding is specified, this is essentially GreedyBytes.
-
-    Analog to :class:`~construct.core.GreedyBytes` , and identical when no enoding is used.
-
-    .. note:: Encodings like UTF16 or UTF32 work fine with GreedyString.
-
-    :param encoding: string for encoding like "utf8", or None for bytes
-
-    :raises StringError: building a unicode string but no encoding
-
-    Example::
-
-        >>> d = GreedyString(encoding="utf8")
-        >>> d.build(u"Афон")
-        b'\xd0\x90\xd1\x84\xd0\xbe\xd0\xbd'
-        >>> d.parse(_)
-        u'Афон'
-    """
-    return StringEncoded(GreedyBytes, encoding)
 
 
 #===============================================================================

@@ -13,10 +13,40 @@ Overall
 General classes
 -----------------
 
-Compiled CompilableMacro added (used internally)
+All constructs: `parse build sizeof` methods take context entries ONLY as keyword parameters \*\*kw (see `this chapter <https://construct.readthedocs.io/en/latest/meta.html>`_)
 
-FocusedSeq uses nested context (alike Struct and Sequence)
+All constructs: `compile benchmark testcompiled` methods were added (see `this chapter <https://construct.readthedocs.io/en/latest/compilation.html#compiling-schemas>`_)
+
+Compiled CompilableMacro Decompiled added (used internally)
+
+String* classes require explicit encoding (see `this page <https://construct.readthedocs.io/en/latest/advanced.html#strings>`_)
+
+Struct Sequence Union FocusedSeq are nesting context (in parse build and sizeof)
+
+Array reimplemented without Range, does not use stream.tell()
+
+If IfThenElse renamed `predicate` parameter to `condfunc`
+
+RestreamData added
+
+ExprAdapter Restreamed Mapping* classes changed parameters order (decoders before endcoders)
+
+HexString removed
+
+
+Exceptions
+-------------
 
 FieldError was replaced with StreamError (raised when stream returns less than requested amount) and FormatFieldError (raised by FormatField class, for example if building Float from non-float value and struct.pack complains).
 
-HexString removed
+StreamError can be raised by most classes, when the stream is not seekable or tellable
+
+StringError can be raised by most classes, when expected bytes but given unicode value
+
+BitIntegerError was replaced with IntegerError
+
+Struct Sequence can raise IndexError and KeyError when dictionaries are missing entries
+
+RepeatError added
+
+RawCopyError added
