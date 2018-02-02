@@ -54,6 +54,11 @@ And here's how we use the special '_' name to get to the upper container in a ne
 >>> st.parse(b"12")
 Container(length1=49)(inner=Container(length2=50)(sum=99))
 
+
+
+Nesting and embedding
+============================
+
 Context entries can also be passed directly through `parse` and `build` methods. However, one should take into account that some classes are nesting context (like Struct Sequence Union FocusedSeq), so entries passed to these end up on upper level. Compare these two examples:
 
 >>> d = Bytes(this.n)
@@ -65,6 +70,18 @@ b'\x00\x00\x00\x00'
 ... )
 >>> d.parse(bytes(100), n=4)
 Container(data=b'\x00\x00\x00\x00')
+
+Embedding also complicates using the context. Notice that `count` is on same level as `data` because embedding simply "levels the plainfield".
+
+>>> outer = Struct(
+...     "count" / Byte,
+...     Embedded(Struct(
+...         "data" / Bytes(this.count),
+...     )),
+... )
+>>> outer.parse(b"\x041234")
+Container(count=4)(data=b'1234')
+
 
 
 Using `this` expression
@@ -148,24 +165,24 @@ These can be used in at least one construct:
 
 
 
-Using `lst_` expression
+Using `list_` expression (not yet implemented)
 ============================
 
-There is also a third expression that takes (obj, list, context) and computes on the second parameter (the list). In constructs that use lambdas with all 3 parameters, those constructs usually process lists of elements and the 2nd parameter ia a list of elements processed so far.
+There is also a third expression that takes (obj, list, context) and computes on the second parameter (the list). In constructs that use lambdas with all 3 parameters, those constructs usually process lists of elements and the 2nd parameter is a list of elements processed so far.
 
 These can be used in at least one construct: 
 
->>> RepeatUntil(lst_[-1] == 0, Byte).parse(b"aioweqnjkscs\x00")
+>>> RepeatUntil(list_[-1] == 0, Byte).parse(b"aioweqnjkscs\x00")
 [97, 105, 111, 119, 101, 113, 110, 106, 107, 115, 99, 115, 0]
 
-In that example, `lst_` gets substituted with following, at each iteration. Index -1 means last element:
+In that example, `list_` gets substituted with following, at each iteration. Index -1 means last element:
 
 ::
 
-    lst_ <- [97]
-    lst_ <- [97, 105]
-    lst_ <- [97, 105, 111]
-    lst_ <- [97, 105, 111, 119]
+    list_ <- [97]
+    list_ <- [97, 105]
+    list_ <- [97, 105, 111]
+    list_ <- [97, 105, 111, 119]
     ...
 
 Known deficiencies

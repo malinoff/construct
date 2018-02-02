@@ -29,11 +29,16 @@ class TestCompile(unittest.TestCase):
             "float1" / Single,
             "float2" / Double,
 
-            "string1" / String(10, encoding=StringsAsBytes),
-            "string2" / String(10, encoding="utf8"),
+            "string1" / String(12, encoding=StringsAsBytes),
+            "string2" / String(12, encoding="utf8"),
+            "string3" / String(12, encoding="utf16"),
+            "string4" / String(12, encoding="utf32"),
             "pascalstring1" / PascalString(Byte, encoding=StringsAsBytes),
             "pascalstring2" / PascalString(Byte, encoding="utf8"),
-            # CString
+            "cstring1" / CString(encoding=StringsAsBytes),
+            "cstring2" / CString(encoding="utf8"),
+            "cstring3" / CString(encoding="utf16"),
+            "cstring4" / CString(encoding="utf32"),
             "greedystring1" / Prefixed(Byte, GreedyString(encoding=StringsAsBytes)),
             "greedystring2" / Prefixed(Byte, GreedyString(encoding="utf8")),
 
@@ -131,5 +136,35 @@ class TestCompile(unittest.TestCase):
         data = bytes(1000)
         d.testcompiled(data)
 
-        # print(d.benchmark(data))
-        # assert False
+    @pytest.mark.skip(reason="enable to run a benchmark with tox")
+    def test_benchmark(self):
+        d = self.example
+        data = bytes(1000)
+        print(d.benchmark(data))
+        assert False
+
+    # def test_benchmark_compiling(benchmark):
+    #     d = benchmark.example
+    #     benchmark(d.compile)
+
+    # def test_benchmark_parse(benchmark):
+    #     d = benchmark.example
+    #     data = bytes(1000)
+    #     benchmark(d.parse, data)
+
+    # def test_benchmark_parse_compiled(benchmark):
+    #     dc = benchmark.example.compile()
+    #     data = bytes(1000)
+    #     benchmark(dc.parse, data)
+
+    # def test_benchmark_build(benchmark):
+    #     d = benchmark.example
+    #     data = bytes(1000)
+    #     obj = d.parse(data)
+    #     benchmark(d.build, obj)
+
+    # def test_benchmark_build_compiled(benchmark):
+    #     dc = benchmark.example.compile()
+    #     data = bytes(1000)
+    #     obj = dc.parse(data)
+    #     benchmark(dc.build, obj)

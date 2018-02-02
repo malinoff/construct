@@ -74,31 +74,19 @@ Strings
 
     Encoding needs to be specified explicitly, although  :func:`~construct.core.setglobalstringencoding` can be used for that as well. Encodings like UTF8 UTF16 UTF32 are recommended. `StringsAsBytes` can be used to specify non-encoding (to allow `str` on Python 2).
 
-.. warning::
-
-    Do not use >1 byte encodings like UTF16 or UTF32 with String and CString classes. This a known bug that has something to do with the fact that library inherently works with bytes (not codepoints) and codepoint-to-byte conversions are too tricky.
-
-    **UTF16 UTF32 will be supported soon.**
-
 .. note::
 
-    Encodings like UTF16 or UTF32 work fine with PascalString and GreedyString.
+    Encodings like UTF16 UTF32 (including little-endian) work fine with all String* classes.
 
 String is a fixed-length construct that pads built string with null bytes, and strips those same null bytes when parsing. Strings can also be trimmed when building. If you supply a too long string, the construct will chop it off apart instead of raising a StringError.
 
-To be honest, using this class is not recommended. There are safer ways to handle variable length strings.
+To be honest, using this class is not recommended. It is provided only for ancient data formats.
 
 >>> String(10, encoding=StringsAsBytes).build(b"hello")
 b'hello\x00\x00\x00\x00\x00'
 
 >>> String(10, encoding="utf8").build("Афон")
 b'\xd0\x90\xd1\x84\xd0\xbe\xd0\xbd\x00\x00'
-
->>> String(10, encoding=StringsAsBytes, padchar=b"XYZ", paddir="center").build(b"abc")
-b'XXXabcXXXX'
-
->>> String(10, encoding=StringsAsBytes, trimdir="right").build(b"12345678901234567890")
-b'1234567890'
 
 PascalString is a variable length string that is prefixed by a length field. This scheme was invented in Pascal language that put Byte field instead of C convention of appending null \\0 byte at the end. Note that the length field does not need to be Byte, and can also be variable length itself, as shown below. VarInt is recommended when designing new protocols.
 
@@ -123,18 +111,45 @@ Booleans are flags:
 
 >>> Flag.parse(b"\x01")
 True
+>>> Flag.build(True)
+b'\x01'
 
 Enums translate between string names and (usually) integer values:
 
->>> Enum(Byte, g=8, h=11).parse(b"\x08")
-'g'
->>> Enum(Byte, g=8, h=11).build(11)
-b'\x0b'
+>>> d = Enum(Byte, zero=0, one=1)
+>>> d.parse(b"\x01")
+'one'
+>>> d.parse(b"\xff")
+construct.core.MappingError: parsing failed, no decoding mapping for 255
+>>> d.build("one")
+b'\x01'
+>>> d.build(1)
+b'\x01'
+>>> d.build(255)
+construct.core.MappingError: building failed, no decoding mapping for 255
+>>> d.build("missing")
+construct.core.MappingError: building failed, no decoding mapping for "missing"
+>>> d.sizeof()
+1
 
 FlagsEnum decomposes an integer value into a set of string labels:
 
->>> FlagsEnum(Byte, a=1, b=2, c=4, d=8).parse(b"\x03")
-Container(c=False)(b=True)(a=True)(d=False)
+>>> d = FlagsEnum(Byte, one=1, two=2, four=4, eight=8)
+>>> d.parse(b"\x03")
+Container(one=True)(two=True)(four=False)(eight=False)
+
+Both Enum and FlagsEnum support merging labels from IntEnum and IntFlag (enum module):
+
+::
+
+    import enum
+    class E(enum.IntEnum):
+        one = 1
+    class F(enum.IntFlag):
+        two = 2
+
+    Enum(Byte,      E, F) <--> Enum(Byte,      one=1, two=2)
+    FlagsEnum(Byte, E, F) <--> FlagsEnum(Byte, one=1, two=2)
 
 
 Processing files (or data)

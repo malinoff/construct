@@ -59,6 +59,8 @@ Development and support
 -------------------------
 Please use `github issues <https://github.com/construct/construct/issues>`_ to ask general questions, make feature requests, report issues and bugs, and to send in patches. Feel free to request any changes that would support your project. There also used to be a `mailing list <https://groups.google.com/d/forum/construct3>`_ but github issues should be preffered.
 
+There is also a `Gitter chat <https://gitter.im/construct-construct/Lobby>`_ but using Issues is highly recommended.
+
 Main documentation is at `readthedocs <http://construct.readthedocs.org>`_, where you can find all kinds of examples. Source is on `github <https://github.com/construct/construct>`_. Releases are available on `pypi <https://pypi.org/project/construct/>`_.
 
 
@@ -66,6 +68,8 @@ Requirements
 --------------
 Construct should run on any Python 2.7 3.3 3.4 3.5 3.6 3.7 pypy pypy3 implementation. Best would be 3.6 because it supports ordered keyword arguments. Second best would be 3.4 because it supports compilation feature.
 
+Enum34 is optional if you want Enum or EnumFlags to take labels from IntEnum or IntFlag (not needed on Python 3.4 and 3.6 respectively).
+
 Numpy is optional, if you want to serialize numpy arrays using Numpy protocol. Otherwise arrays can still be serialized using Array construct.
 
-Different Python versions support different compression modules (like gzip), if you want to use Compressed construct.
+Different Python versions support different compression modules (like gzip lzma), if you want to use Compressed construct.

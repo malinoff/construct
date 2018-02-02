@@ -4,6 +4,7 @@ import struct, io, binascii, collections, sys
 
 from construct.lib import *
 from construct.expr import *
+from construct.version import *
 
 
 #===============================================================================
@@ -60,7 +61,7 @@ def singleton(arg):
 
 def _read_stream(stream, length):
     if length < 0:
-        raise StreamError("length must be >= 0", length)
+        raise StreamError("length must be non-negative, found %s" % length)
     try:
         data = stream.read(length)
     except Exception:
@@ -79,7 +80,7 @@ def _read_stream_entire(stream):
 
 def _write_stream(stream, length, data):
     if length < 0:
-        raise StreamError("length must be >= 0", length)
+        raise StreamError("length must be non-negative, found %s" % length)
     if len(data) != length:
         raise StreamError("could not write bytes, expected %d, found %d" % (length, len(data)))
     try:
@@ -125,6 +126,27 @@ class CodeGen:
 
     def toString(self):
         return "\n".join(self.blocks + [""])
+
+
+def mergefields(*subcons):
+
+    def select(sc):
+        if isinstance(sc, (Renamed, Embedded)):
+            return select(sc.subcon)
+        # experimental support for EmbeddedBitStruct
+        # if isinstance(sc, (Restreamed, CompilableMacro)):
+        #     return select(sc.subcon)
+        if isinstance(sc, (Struct, Sequence, FocusedSeq, Union)):
+            return list(sc.subcons)
+        raise ConstructError("Embedding only works with: Struct, Sequence, FocusedSeq, Union")
+
+    result = []
+    for sc in subcons:
+        if sc.flagembedded:
+            result.extend(select(sc))
+        else:
+            result.append(sc)
+    return result
 
 
 #===============================================================================
@@ -320,7 +342,12 @@ class Construct(object):
             from construct.lib import *
             from io import BytesIO
             from struct import pack, unpack, calcsize
+            import sys
             import collections
+
+            assert sys.version_info[:2] >= (3,4)
+            assert version_string == %r
+
             def read_bytes(io, count):
                 assert count >= 0
                 data = io.read(count)
@@ -328,7 +355,7 @@ class Construct(object):
                 return data
             def restream(data, func):
                 return func(BytesIO(data))
-        """)
+        """ % (version_string, ))
         code.append("""
             def parseall(io, this):
                 return %s
@@ -346,7 +373,7 @@ class Construct(object):
         compiledschema.defersubcon = self
         return compiledschema
 
-    def _decompile(self, code):
+    def _decompile(self, code, recursive=False):
         """Used internally."""
         if id(self) in code.decompiledcache:
             return code.decompiledcache[id(self)]
@@ -359,14 +386,16 @@ class Construct(object):
             code.decompiledcache[id(self)] = cname
             return cname
         except NotImplementedError:
+            if recursive:
+                raise NotImplementedError
             cname = "decompiled_%s" % code.allocateId()
             code.append("""
                 %s = Decompiled(lambda io,this: %s)
-            """ % (cname, self._compileparse(code), ))
+            """ % (cname, self._compileparse(code, recursive=True), ))
             code.decompiledcache[id(self)] = cname
             return cname
 
-    def _compileparse(self, code):
+    def _compileparse(self, code, recursive=False):
         """Used internally."""
         if id(self) in code.parsercache:
             return code.parsercache[id(self)]
@@ -376,7 +405,9 @@ class Construct(object):
             code.parsercache[id(self)] = emitted
             return emitted
         except NotImplementedError:
-            emitted = "%s._parse(io, this, None)" % (self._decompile(code), )
+            if recursive:
+                raise NotImplementedError
+            emitted = "%s._parse(io, this, None)" % (self._decompile(code, recursive=True), )
             code.parsercache[id(self)] = emitted
             return emitted
 
@@ -411,22 +442,37 @@ class Construct(object):
         :returns: string containing runtimes and descriptions
         """
         from timeit import timeit
-        parsetime = timeit(lambda: self.parse(sampledata), number=1000)/1000
-        sampleobj = self.parse(sampledata)
-        buildtime = timeit(lambda: self.build(sampleobj), number=1000)/1000
 
         try:
+            parsetime = "failed"
+            buildtime = "failed"
             compiletime = "failed"
             parsetime2 = "failed"
             buildtime2 = "failed"
+
+            sampleobj = self.parse(sampledata)
+            parsetime = timeit(lambda: self.parse(sampledata), number=1000)/1000
+            self.build(sampleobj)
+            buildtime = timeit(lambda: self.build(sampleobj), number=1000)/1000
             compiled = self.compile()
             compiletime = timeit(lambda: self.compile(), number=100)/100
+            compiled.parse(sampledata)
             parsetime2 = timeit(lambda: compiled.parse(sampledata), number=1000)/1000
+            compiled.build(sampleobj)
             buildtime2 = timeit(lambda: compiled.build(sampleobj), number=1000)/1000
         except Exception:
             pass
 
-        return "Timeit measurements:\ncompiling:         {:.20f} sec/call\nparsing:           {:.20f} sec/call\nparsing compiled:  {:.20f} sec/call\nbuilding:          {:.20f} sec/call\nbuilding compiled: {:.20f} sec/call\n".format(compiletime, parsetime, parsetime2, buildtime, buildtime2)
+        lines = [
+            "Timeit measurements:",
+            "compiling:         {:.20f} sec/call",
+            "parsing:           {:.20f} sec/call",
+            "parsing compiled:  {:.20f} sec/call",
+            "building:          {:.20f} sec/call",
+            "building compiled: {:.20f} sec/call",
+            ""
+        ]
+        return "\n".join(lines).format(compiletime, parsetime, parsetime2, buildtime, buildtime2)
 
     def testcompiled(self, sampledata):
         """
@@ -758,6 +804,8 @@ def Bitwise(subcon):
     """
     macro = Restreamed(subcon, bytes2bits, 1, bits2bytes, 8, lambda n: n//8)
     def _emitparse(self, code):
+        if subcon.sizeof() % 8:
+            raise ConstructError("Bitwise cannot compile with subcon size not a multiple of 8")
         return "restream(bytes2bits(read_bytes(io, %s)), lambda io: %s)" % (subcon.sizeof()//8, subcon._compileparse(code), )
     return CompilableMacro(macro, _emitparse)
 
@@ -1218,7 +1266,19 @@ globalstringencoding = None
 
 @singleton
 class StringsAsBytes:
+    """
+    Used for marking String* classes to not encode/decode bytes (allows using `str` on Python 2).
+    """
     pass
+
+
+possiblestringencodings = dict(
+    StringsAsBytes=1,
+    ascii=1,
+    utf8=1, utf_8=1, U8=1,
+    utf16=2, utf_16=2, U16=2, utf_16_be=2, utf_16_le=2,
+    utf32=4, utf_32=4, U32=4, utf_32_be=4, utf_32_le=4,
+)
 
 
 def setglobalstringencoding(encoding):
@@ -1270,76 +1330,161 @@ class StringEncoded(Adapter):
         raise StringError("String* classes require explicit encoding")
 
 
-class StringPaddedTrimmed(Adapter):
+class StringPaddedTrimmed(Construct):
     """Used internally."""
-    __slots__ = ["length", "padchar", "paddir", "trimdir"]
+    __slots__ = ["length", "encoding"]
 
-    def __init__(self, length, subcon, padchar=b"\x00", paddir="right", trimdir="right"):
-        if not isinstance(padchar, bytestringtype) or len(padchar) != 1:
-            raise StringError("padchar must be b-string character")
-        if paddir not in ["right","left","center"]:
-            raise StringError("paddir must be one of: right left center")
-        if trimdir not in ["right","left"]:
-            raise StringError("trimdir must be one of: right left")
-        super(StringPaddedTrimmed, self).__init__(subcon)
+    def __init__(self, length, encoding):
+        super(StringPaddedTrimmed, self).__init__()
         self.length = length
-        self.padchar = padchar
-        self.paddir = paddir
-        self.trimdir = trimdir
+        self.encoding = encoding
 
-    def _decode(self, obj, context):
-        if self.paddir == "right":
-            obj = obj.rstrip(self.padchar)
-        if self.paddir == "left":
-            obj = obj.lstrip(self.padchar)
-        if self.paddir == "center":
-            obj = obj.strip(self.padchar)
-        return obj
-
-    def _encode(self, obj, context):
+    def _parse(self, stream, context, path):
         length = self.length(context) if callable(self.length) else self.length
-        if self.paddir == "right":
-            obj = obj.ljust(length, self.padchar)
-        if self.paddir == "left":
-            obj = obj.rjust(length, self.padchar)
-        if self.paddir == "center":
-            obj = obj.center(length, self.padchar)
-        if len(obj) > length:
-            if self.trimdir == "right":
-                obj = obj[:length]
-            if self.trimdir == "left":
-                obj = obj[-length:]
+
+        encoding = self.encoding or globalstringencoding
+        if encoding is StringsAsBytes:
+            encoding = "StringsAsBytes"
+        if encoding not in possiblestringencodings:
+            raise StringError("encoding not implemented: %r" % (encoding,))
+        unitsize = possiblestringencodings[encoding]
+        finalunit = b"\x00" * unitsize
+
+        if length % unitsize:
+            raise StringError("byte length must be multiple of encoding-unit, %s" % (unitsize,))
+        obj = _read_stream(stream, length)
+        while obj[-unitsize:] == finalunit:
+            obj = obj[:-unitsize]
         return obj
+
+    def _build(self, obj, stream, context, path):
+        length = self.length(context) if callable(self.length) else self.length
+
+        encoding = self.encoding or globalstringencoding
+        if encoding is StringsAsBytes:
+            encoding = "StringsAsBytes"
+        if encoding not in possiblestringencodings:
+            raise StringError("encoding not implemented: %r" % (encoding,))
+        unitsize = possiblestringencodings[encoding]
+        finalunit = b"\x00" * unitsize
+
+        if length % unitsize:
+            raise StringError("byte length must be multiple of encoding-unit, %s" % (unitsize,))
+        if len(obj) % unitsize:
+            raise StringError("string length must be multiple of encoding-unit, %s" % (unitsize,))
+        if len(obj) > length-unitsize:
+            obj = obj[:length-unitsize]
+        obj = obj.ljust(length, b"\x00")
+        _write_stream(stream, len(obj), obj)
+
+    def _sizeof(self, context, path):
+        length = self.length(context) if callable(self.length) else self.length
+        return length
 
     def _emitparse(self, code):
-        if self.paddir == "right":
-            func = "rstrip"
-        if self.paddir == "left":
-            func = "lstrip"
-        if self.paddir == "center":
-            func = "strip"
-        return "(%s).%s(%r)" % (self.subcon._compileparse(code), func, self.padchar)
+        encoding = self.encoding or globalstringencoding
+        if encoding is StringsAsBytes:
+            encoding = "StringsAsBytes"
+        if encoding not in possiblestringencodings:
+            raise StringError("encoding not implemented: %r" % (encoding,))
+        unitsize = possiblestringencodings[encoding]
+        finalunit = b"\x00" * unitsize
+
+        code.append(r"""
+            def parse_paddedtrimmedstring(io, length, unitsize, finalunit):
+                if length % unitsize:
+                    raise StringError
+                obj = read_bytes(io, length)
+                while obj[-unitsize:] == finalunit:
+                    obj = obj[:-unitsize]
+                return obj
+        """)
+        return "parse_paddedtrimmedstring(io, %r, %r, %r)" % (self.length, unitsize, finalunit, )
 
 
-def String(length, encoding=None, padchar=b"\x00", paddir="right", trimdir="right"):
+class StringNullTerminated(Construct):
+    """Used internally."""
+    __slots__ = ["encoding"]
+
+    def __init__(self, encoding=None):
+        super(StringNullTerminated, self).__init__()
+        self.encoding = encoding
+
+    def _parse(self, stream, context, path):
+        encoding = self.encoding or globalstringencoding
+        if encoding is StringsAsBytes:
+            encoding = "StringsAsBytes"
+        if encoding not in possiblestringencodings:
+            raise StringError("encoding not implemented: %r" % (encoding,))
+        unitsize = possiblestringencodings[encoding]
+        finalunit = b"\x00" * unitsize
+
+        result = []
+        while True:
+            unit = _read_stream(stream, unitsize)
+            if unit == finalunit:
+                break
+            result.append(unit)
+        return b"".join(result)
+
+    def _build(self, obj, stream, context, path):
+        encoding = self.encoding or globalstringencoding
+        if encoding is StringsAsBytes:
+            encoding = "StringsAsBytes"
+        if encoding not in possiblestringencodings:
+            raise StringError("encoding not implemented: %r" % (encoding,))
+        unitsize = possiblestringencodings[encoding]
+        finalunit = b"\x00" * unitsize
+
+        if len(obj) % unitsize:
+            raise StringError("string length must be multiple of encoding-unit, %s" % (unitsize,))
+        data = obj + finalunit
+        _write_stream(stream, len(data), data)
+
+    def _emitdecompiled(self, code):
+        encoding = self.encoding or globalstringencoding
+        if encoding is StringsAsBytes:
+            encoding = "StringsAsBytes"
+        if encoding not in possiblestringencodings:
+            raise StringError("encoding not implemented: %r" % (encoding,))
+
+        return "StringNullTerminated(encoding=%r)" % (encoding,)
+
+    def _emitparse(self, code):
+        encoding = self.encoding or globalstringencoding
+        if encoding is StringsAsBytes:
+            encoding = "StringsAsBytes"
+        if encoding not in possiblestringencodings:
+            raise StringError("encoding not implemented: %r" % (encoding,))
+        unitsize = possiblestringencodings[encoding]
+        finalunit = b"\x00" * unitsize
+
+        code.append("""
+            def parse_nullterminatedstring(io, unitsize, finalunit):
+                result = []
+                while True:
+                    unit = read_bytes(io, unitsize)
+                    if unit == finalunit:
+                        break
+                    result.append(unit)
+                return b"".join(result)
+        """)
+        return "parse_nullterminatedstring(io, %r, %r)" % (unitsize, finalunit, )
+
+
+def String(length, encoding=None):
     r"""
     Configurable, fixed-length or variable-length string field.
 
-    When parsing, the byte string is stripped of byte character (as specified) from the direction (as specified) then decoded (as specified). Length is an integer or context lambda.
-    When building, the string is encoded (as specified) then padded (as specified) from the direction (as specified) or trimmed (as specified).
-    Size is same as length parameter.
-
-    .. warning:: Do not use >1 byte encodings like UTF16 or UTF32 with String and CString classes. This a known bug that has something to do with the fact that library inherently works with bytes (not codepoints) and codepoint-to-byte conversions are too tricky.
+    When parsing, the byte string is stripped of null bytes (per encoding unit), then decoded. Length is an integer or context lambda. When building, the string is encoded, then trimmed to specified length minus encoding unit, then padded to specified length. Size is same as length parameter.
 
     :param length: integer or context lambda, length in bytes (not unicode characters)
-    :param encoding: string like "utf8", or StringsAsBytes, or None (use global override)
-    :param padchar: bytes character to pad out strings, by default b"\\x00"
-    :param paddir: string, direction to pad out strings (one of: right left both)
-    :param trimdir: string, direction to trim strings (one of: right left)
+    :param encoding: string like "utf8" "utf16" "utf32", or StringsAsBytes, or None (use global override)
 
     :raises StringError: String* classes require explicit encoding
     :raises StringError: building a unicode string but no encoding
-    :raises StringError: padchar paddir trimdir are not valid
+    :raises StringError: specified length or object for building is not a multiple of unit
+    :raises StringError: selected encoding is not on supported list
 
     Can propagate any exception from the lambda, possibly non-ConstructError.
 
@@ -1369,21 +1514,15 @@ def String(length, encoding=None, padchar=b"\x00", paddir="right", trimdir="righ
         >>> d.build(b"12345678901234567890")
         b'1234567890'
     """
-    return StringEncoded(
-        StringPaddedTrimmed(length, Bytes(length), padchar, paddir, trimdir),
-        encoding)
+    return StringEncoded(StringPaddedTrimmed(length, encoding), encoding)
 
 
 def PascalString(lengthfield, encoding=None):
     r"""
-    Length-prefixed string. The length field can be variable length (such as VarInt) or fixed length (such as Int64ub). VarInt is recommended when designing new protocols. Stored length is in bytes, not characters.
+    Length-prefixed string. The length field can be variable length (such as VarInt) or fixed length (such as Int64ub). VarInt is recommended when designing new protocols. Stored length is in bytes, not characters. Size is not defined.
 
-    Size is not defined.
-
-    .. note:: Encodings like UTF16 or UTF32 work fine with PascalString and GreedyString.
-
-    :param lengthfield: Construct instance, field used to parse and build the length (likw VarInt Int64ub)
-    :param encoding: string like "utf8", or StringsAsBytes, or None (use global override)
+    :param lengthfield: Construct instance, field used to parse and build the length (like VarInt Int64ub)
+    :param encoding: string like "utf8" "utf16" "utf32", or StringsAsBytes, or None (use global override)
 
     :raises StringError: String* classes require explicit encoding
     :raises StringError: building a unicode string but no encoding
@@ -1399,21 +1538,16 @@ def PascalString(lengthfield, encoding=None):
     return StringEncoded(Prefixed(lengthfield, GreedyBytes), encoding)
 
 
-def CString(terminators=b"\x00", encoding=None):
+def CString(encoding=None):
     r"""
     String ending in a terminating null byte (or null bytes in case of UTF16 UTF32).
 
-    reimplement???
-
-    By default, the terminator is the \\x00 byte character. Terminators field can be a longer bytes, and any one of the characters breaks parsing. First terminator byte is used when building.
-
-    .. warning:: Do not use >1 byte encodings like UTF16 or UTF32 with String and CString classes. This a known bug that has something to do with the fact that library inherently works with bytes (not codepoints) and codepoint-to-byte conversions are too tricky.
-
-    :param terminators: ??? sequence of valid terminators, first is used when building, all are used when parsing
-    :param encoding: string like "utf8", or StringsAsBytes, or None (use global override)
+    :param encoding: string like "utf8" "utf16" "utf32", or StringsAsBytes, or None (use global override)
 
     :raises StringError: String* classes require explicit encoding
     :raises StringError: building a unicode string but no encoding
+    :raises StringError: object for building is not a multiple of unit
+    :raises StringError: selected encoding is not on supported list
 
     Example::
 
@@ -1423,12 +1557,12 @@ def CString(terminators=b"\x00", encoding=None):
         >>> d.parse(_)
         u'Афон'
     """
-    return StringEncoded(
-        ExprAdapter(
-            RepeatUntil(lambda obj,lst,ctx: int2byte(obj) in terminators, Byte),
-            decoder = lambda obj,ctx: b''.join(int2byte(c) for c in obj[:-1]),
-            encoder = lambda obj,ctx: iterateints(obj+terminators), ),
-        encoding)
+    return StringEncoded(StringNullTerminated(encoding), encoding)
+        # ExprAdapter(
+        #     RepeatUntil(lambda obj,lst,ctx: int2byte(obj) in terminators, Byte),
+        #     decoder = lambda obj,ctx: b''.join(int2byte(c) for c in obj[:-1]),
+        #     encoder = lambda obj,ctx: iterateints(obj+terminators), ),
+        # encoding)
 
 
 def GreedyString(encoding=None):
@@ -1437,9 +1571,7 @@ def GreedyString(encoding=None):
 
     Analog to :class:`~construct.core.GreedyBytes` , and identical when no enoding is used.
 
-    .. note:: Encodings like UTF16 or UTF32 work fine with PascalString and GreedyString.
-
-    :param encoding: string like "utf8", or StringsAsBytes, or None (use global override)
+    :param encoding: string like "utf8" "utf16" "utf32", or StringsAsBytes, or None (use global override)
 
     :raises StringError: String* classes require explicit encoding
     :raises StringError: building a unicode string but no encoding
@@ -1487,7 +1619,7 @@ class Flag(Construct):
         return "(read_bytes(io, 1) != b'\\x00')"
 
 
-class Enum(Subconstruct):
+class Enum(Adapter):
     r"""
     Translates unicode label names to subcon values, and vice versa. 
 
@@ -1495,7 +1627,7 @@ class Enum(Subconstruct):
     Size is same as subcon, unless it raises SizeofError.
 
     :param subcon: Construct instance, subcon to map to/from
-    :param default: optional, keyword-only argument that specifies the default value to use when an unknown label gets build, can overlap with some existing label, if ``Pass`` then parsing returns "default" label and building skips stream
+    :param \*merge: optional, list of enum.IntEnum and enum.IntFlag instances, to merge labels and values from
     :param \*\*mapping: dict, mapping string names to values
 
     :raises MappingError: label (during building) or value (during parsing) cannot be translated, and no default was provided
@@ -1506,51 +1638,49 @@ class Enum(Subconstruct):
         >>> d.parse(b"\x01")
         'one'
         >>> d.parse(b"\xff")
-        construct.core.MappingError: no decoding mapping for 255
+        construct.core.MappingError: parsing failed, no decoding mapping for 255
         >>> d.build("one")
         b'\x01'
         >>> d.build(1)
         b'\x01'
-    """
-    __slots__ = ["default", "encmapping", "decmapping"]
+        >>> d.build(255)
+        construct.core.MappingError: building failed, no decoding mapping for 255
+        >>> d.build("missing")
+        construct.core.MappingError: building failed, no decoding mapping for "missing"
+        >>> d.sizeof()
+        1
 
-    def __init__(self, subcon, default=NotImplemented, **mapping):
+        import enum
+        class E(enum.IntEnum):
+            one = 1
+        class F(enum.IntFlag):
+            two = 2
+        Enum(Byte,      E, F) <--> Enum(Byte,      one=1, two=2)
+        FlagsEnum(Byte, E, F) <--> FlagsEnum(Byte, one=1, two=2)
+    """
+    __slots__ = ["encmapping", "decmapping"]
+
+    def __init__(self, subcon, *merge, **mapping):
         super(Enum, self).__init__(subcon)
-        self.default = default
+        for enum in merge:
+            for enumentry in enum:
+                mapping[enumentry.name] = enumentry.value
         self.encmapping =      {k:v for k,v in mapping.items()}
         self.encmapping.update({v:v for k,v in mapping.items()})
         self.decmapping =      {v:k for k,v in mapping.items()}
         self.decmapping.update({k:k for k,v in mapping.items()})
-        if self.default is not NotImplemented and self.default is not Pass:
-            if True:
-                self.decmapping.update({"default":default})
-            if default not in self.decmapping:
-                self.decmapping.update({default:"default"})
 
-    def _parse(self, stream, context, path):
-        obj2 = self.subcon._parse(stream, context, path)
+    def _decode(self, obj, context):
         try:
-            obj = self.decmapping[obj2]
+            return self.decmapping[obj]
         except KeyError:
-            if self.default is NotImplemented:
-                raise MappingError("parsing failed, no mapping for %r, no default either" % (obj2,))
-            if self.default is Pass:
-                return "default"
-            return "default"
-        return obj
+            raise MappingError("parsing failed, no mapping for %r" % (obj,))
 
-    def _build(self, obj, stream, context, path):
+    def _encode(self, obj, context):
         try:
-            obj2 = self.encmapping[obj]
+            return self.encmapping[obj]
         except KeyError:
-            if self.default is NotImplemented:
-                raise MappingError("building failed, no mapping for %r, no default either" % (obj,))
-            if self.default is Pass:
-                return
-            obj = "default"
-            obj2 = self.default
-        self.subcon._build(obj2, stream, context, path)
-        return obj
+            raise MappingError("building failed, no mapping for %r" % (obj,))
 
 
 class FlagsEnum(Adapter):
@@ -1561,6 +1691,7 @@ class FlagsEnum(Adapter):
     Size is same as subcon, unless it raises SizeofError.
 
     :param subcon: Construct instance, must operate on integers
+    :param \*merge: optional, list of enum.IntEnum and enum.IntFlag instances, to merge labels and values from
     :param \*\*flags: dict, mapping string names to integer values
 
     Can raise arbitrary exceptions when computing | and & and value is non-integer.
@@ -1570,11 +1701,22 @@ class FlagsEnum(Adapter):
         >>> d = FlagsEnum(Byte, a=1, b=2, c=4, d=8)
         >>> d.parse(b"\x03")
         Container(c=False)(b=True)(a=True)(d=False)
+
+        import enum
+        class E(enum.IntEnum):
+            one = 1
+        class F(enum.IntFlag):
+            two = 2
+        Enum(Byte,      E, F) <--> Enum(Byte,      one=1, two=2)
+        FlagsEnum(Byte, E, F) <--> FlagsEnum(Byte, one=1, two=2)
     """
     __slots__ = ["flags"]
 
-    def __init__(self, subcon, **flags):
+    def __init__(self, subcon, *merge, **flags):
         super(FlagsEnum, self).__init__(subcon)
+        for enum in merge:
+            for enumentry in enum:
+                flags[enumentry.name] = enumentry.value
         self.flags = flags
 
     def _decode(self, obj, context):
@@ -1671,15 +1813,15 @@ class Struct(Construct):
     r"""
     Sequence of usually named constructs, similar to structs in C. The members are parsed and build in the order they are defined. If a member is anonymous (its name is None) then it gets parsed and the value discarded, or it gets build from nothing (from None).
 
-    Some fields do not need to be named, since they are built without value anyway. See Const Padding Check Error Pass Terminated Seek for examples of such fields.
-
-    :class:`~construct.core.Embedded` fields do not need to be named.
+    Some fields do not need to be named, since they are built without value anyway. See: Const Padding Check Error Pass Terminated Seek Tell for examples of such fields. :class:`~construct.core.Embedded` fields do not need to (and should not) be named.
 
     Operator + can also be used to make Structs (although not recommended).
 
     Parses into a Container (dict with attribute and key access) where keys match subcon names. If field has embedded flag, its assuned to parse into a dict which entries get merged with result dict. Builds from a dict (not necessarily a Container) where each member gets a value from the dict matching the subcon name. If field has build-from-none flag, it gets build even when there is no mathing entry in the dict. If field has embedded flag, it gets build from the entire dict itself. Size is the sum of all subcon sizes, unless any subcon raises SizeofError.
 
     This class does context nesting, meaning its members are given access to a new dictionary where the "_" entry points to the outer context. When parsing, each member gets parsed and subcon parse return value is inserted into context under matching key only if the member was named. When building, the matching entry gets inserted into context before subcon gets build, and if subcon build returns a new value (not None) that gets replaced in the context.
+
+    This class supports embedding. :class:`~construct.core.Embedded` semantics dictate, that during instance creation (in ctor), each field is checked for embedded flag, and its subcons members merged. This changes behavior of some code examples. Only few classes are supported: Struct Sequence FocusedSeq Union, although those can be used interchangably (a Struct can embed a Sequence, or rather its members). EmbeddedBitStruct is not currently supported (yet to be resolved).
 
     :param \*subcons: Construct instances, list of members, some can be anonymous
     :param \*\*kw: Construct instances, list of members (requires Python 3.6)
@@ -1713,7 +1855,8 @@ class Struct(Construct):
 
     def __init__(self, *subcons, **kw):
         super(Struct, self).__init__()
-        self.subcons = list(subcons) + list(k/v for k,v in kw.items()) 
+        subcons = list(subcons) + list(k/v for k,v in kw.items())
+        self.subcons = mergefields(*subcons)
 
     def _parse(self, stream, context, path):
         obj = Container()
@@ -1721,14 +1864,9 @@ class Struct(Construct):
         for sc in self.subcons:
             try:
                 subobj = sc._parse(stream, context, path)
-                if sc.flagembedded:
-                    if subobj is not None:
-                        obj.update(subobj)
-                        context.update(subobj)
-                else:
-                    if sc.name:
-                        obj[sc.name] = subobj
-                        context[sc.name] = subobj
+                if sc.name:
+                    obj[sc.name] = subobj
+                    context[sc.name] = subobj
             except StopIteration:
                 break
         return obj
@@ -1738,27 +1876,18 @@ class Struct(Construct):
         context.update(obj)
         for sc in self.subcons:
             try:
-                if sc.flagembedded:
-                    subobj = obj
-                elif sc.flagbuildnone:
+                if sc.flagbuildnone:
                     subobj = obj.get(sc.name, None)
                 else:
                     subobj = obj[sc.name] # raises KeyError
 
-                if sc.flagembedded:
-                    if subobj is not None:
-                        context.update(subobj)
-                else:
-                    if sc.name:
-                        context[sc.name] = subobj
+                if sc.name:
+                    context[sc.name] = subobj
 
                 buildret = sc._build(subobj, stream, context, path)
                 if buildret is not None:
-                    if sc.flagembedded:
-                        context.update(buildret)
-                    else:
-                        if sc.name:
-                            context[sc.name] = buildret
+                    if sc.name:
+                        context[sc.name] = buildret
             except StopIteration:
                 break
         return context
@@ -1791,14 +1920,9 @@ class Struct(Construct):
                 this = Container(_ = this)
         """ % (fname, )
         for sc in self.subcons:
-            if sc.flagembedded:
-                block += """
-                this.update(%s)
-                """ % (sc._compileparse(code), )
-            else:
-                block += """
+            block += """
                 %s%s
-                """ % ("this[%r] = " % sc.name if sc.name else "", sc._compileparse(code))
+            """ % ("this[%r] = " % sc.name if sc.name else "", sc._compileparse(code))
         block += """
                 del this._
                 return this
@@ -1807,17 +1931,17 @@ class Struct(Construct):
         return "%s(io, this)" % (fname,)
 
 
-class Sequence(Struct):
+class Sequence(Construct):
     r"""
-    Sequence of usually un-named constructs. The members are parsed and build in the order they are defined. If a member is named, its parsed value gets inserted into the context. This allows using members that refer to previous members.
-
-    :class:`~construct.core.Embedded` fields do not need to be named.
+    Sequence of usually un-named constructs. The members are parsed and build in the order they are defined. If a member is named, its parsed value gets inserted into the context. This allows using members that refer to previous members. :class:`~construct.core.Embedded` fields do not need to (and should not) be named.
 
     Operator >> can also be used to make Sequences (although not recommended).
 
     Parses into a ListContainer (list with pretty-printing) where values are in same order as subcons. If field has embedded flag, its assumed to parse into a list which elements get merged with result list. Builds from a list (not necessarily a ListContainer) where each subcon is given the element at respective position. If field has embedded flag, it gets build from a following subset of entire list. Size is the sum of all subcon sizes, unless any subcon raises SizeofError.
 
     This class does context nesting, meaning its members are given access to a new dictionary where the "_" entry points to the outer context. When parsing, each member gets parsed and subcon parse return value is inserted into context under matching key only if the member was named. When building, the matching entry gets inserted into context before subcon gets build, and if subcon build returns a new value (not None) that gets replaced in the context.
+
+    This class supports embedding. :class:`~construct.core.Embedded` semantics dictate, that during instance creation (in ctor), each field is checked for embedded flag, and its subcons members merged. This changes behavior of some code examples. Only few classes are supported: Struct Sequence FocusedSeq Union, although those can be used interchangably (a Struct can embed a Sequence, or rather its members). EmbeddedBitStruct is not currently supported (yet to be resolved).
 
     :param \*subcons: Construct instances, list of members, some can be named
     :param \*\*kw: Construct instances, list of members (requires Python 3.6)
@@ -1839,6 +1963,12 @@ class Sequence(Struct):
         Alternative syntax, but requires Python 3.6:
         >>> Sequence(a=Byte, b=Byte, c=Byte, d=Byte)
     """
+    __slots__ = ["subcons"]
+
+    def __init__(self, *subcons, **kw):
+        super(Sequence, self).__init__()
+        subcons = list(subcons) + list(k/v for k,v in kw.items())
+        self.subcons = mergefields(*subcons)
 
     def _parse(self, stream, context, path):
         obj = ListContainer()
@@ -1846,10 +1976,7 @@ class Sequence(Struct):
         for i,sc in enumerate(self.subcons):
             try:
                 subobj = sc._parse(stream, context, path)
-                if sc.flagembedded:
-                    obj.extend(subobj)
-                else:
-                    obj.append(subobj)
+                obj.append(subobj)
                 if sc.name:
                     context[sc.name] = subobj
             except StopIteration:
@@ -1858,25 +1985,24 @@ class Sequence(Struct):
 
     def _build(self, obj, stream, context, path):
         context = Container(_ = context)
-        objiter = iter(obj)
-        for i,sc in enumerate(self.subcons):
+        for i,(sc,subobj) in enumerate(zip(self.subcons, obj)):
             try:
-                if sc.flagembedded:
-                    subobj = objiter
-                else:
-                    subobj = next(objiter)
-
                 if sc.name:
                     context[sc.name] = subobj
 
                 buildret = sc._build(subobj, stream, context, path)
                 if buildret is not None:
-                    if sc.flagembedded:
-                        context.update(buildret)
                     if sc.name:
                         context[sc.name] = buildret
             except StopIteration:
                 break
+
+    def _sizeof(self, context, path):
+        context = Container(_ = context)
+        try:
+            return sum(sc._sizeof(context, path) for sc in self.subcons)
+        except (KeyError, AttributeError):
+            raise SizeofError("cannot calculate size, key not found in context")
 
     def _emitparse(self, code):
         fname = "parse_sequence_%s" % code.allocateId()
@@ -1886,14 +2012,9 @@ class Sequence(Struct):
                 this = Container(_ = this)
         """ % (fname,)
         for sc in self.subcons:
-            if sc.flagembedded:
-                block += """
-                result.extend(%s)
-                """ % (sc._compileparse(code))
-            else:
-                block += """
+            block += """
                 result.append(%s)
-                """ % (sc._compileparse(code))
+            """ % (sc._compileparse(code))
             if sc.name:
                 block += """
                 this[%r] = result[-1]
@@ -2168,9 +2289,13 @@ class RepeatUntil(Subconstruct):
 #===============================================================================
 class Embedded(Subconstruct):
     r"""
-    Special wrapper that allows outer Struct or Sequence to see a field as embedded. Embedded does not change a field, only wraps it like a candy with a flag.
+    Special wrapper that allows outer many-subcons construct to merge fields from another many-subcons construct. Embedded does not change a field, only wraps it like a candy with a flag.
 
-    .. warning:: You can use Embedded(Switch(...)) but not Switch(Embedded(...)). Sames applies to If and IfThenElse macros.
+    .. warning:: 
+
+        Can only be used between Struct Sequence FocusedSeq Union, although they can be used interchangably, for example Struct can embed fields from a Sequence. 
+
+        EmbeddedBitStruct and Lazy* are not currently supported (yet to be resolved).
 
     Parsing building and size are deferred to subcon.
 
@@ -2178,9 +2303,13 @@ class Embedded(Subconstruct):
 
     Example::
 
-        >>> d = Struct("a"/Byte, Embedded(Struct("b"/Byte)), "c"/Byte)
-        >>> d.parse(b"abc")
-        Container(a=97)(b=98)(c=99)
+        >>> outer = Struct(
+        ...     Embedded(Struct(
+        ...         "data" / Bytes(4),
+        ...     )),
+        ... )
+        >>> outer.parse(b"1234")
+        Container(data=b'1234')
     """
 
     def __init__(self, subcon):
@@ -2528,6 +2657,8 @@ class FocusedSeq(Construct):
 
     This class does context nesting, meaning its members are given access to a new dictionary where the "_" entry points to the outer context. When parsing, each member gets parsed and subcon parse return value is inserted into context under matching key only if the member was named. When building, the matching entry gets inserted into context before subcon gets build, and if subcon build returns a new value (not None) that gets replaced in the context.
 
+    This class supports embedding. :class:`~construct.core.Embedded` semantics dictate, that during instance creation (in ctor), each field is checked for embedded flag, and its subcons members merged. This changes behavior of some code examples. Only few classes are supported: Struct Sequence FocusedSeq Union, although those can be used interchangably (a Struct can embed a Sequence, or rather its members). EmbeddedBitStruct is not currently supported (yet to be resolved).
+
     This class is used internally to implement :class:`~construct.core.PrefixedArray`.
 
     :param parsebuildfrom: integer index or string name or context lambda, selects a subcon
@@ -2559,7 +2690,8 @@ class FocusedSeq(Construct):
     def __init__(self, parsebuildfrom, *subcons, **kw):
         super(FocusedSeq, self).__init__()
         self.parsebuildfrom = parsebuildfrom
-        self.subcons = list(subcons) + list(k/v for k,v in kw.items())
+        subcons = list(subcons) + list(k/v for k,v in kw.items())
+        self.subcons = mergefields(*subcons)
 
     def _parse(self, stream, context, path):
         context = Container(_ = context)
@@ -2744,13 +2876,13 @@ class NamedTuple(Adapter):
 #===============================================================================
 class Union(Construct):
     r"""
-    Treats the same data as multiple constructs (similar to C union) so you can look at the data in multiple views.
-
-    :class:`~construct.core.Embedded` fields do not need to be named.
+    Treats the same data as multiple constructs (similar to C union) so you can look at the data in multiple views. Fields are usually named (so parsed values are inserted into dictionary under same name). :class:`~construct.core.Embedded` fields do not need to (and should not) be named.
 
     Parses subcons in sequence, and reverts the stream back to original position after each subcon. Afterwards, advances the stream by selected subcon. Builds from any subcon that has a matching key in given dict. Size is undefined (because parsefrom is not used for building).
 
     This class does context nesting, meaning its members are given access to a new dictionary where the "_" entry points to the outer context. When parsing, each member gets parsed and subcon parse return value is inserted into context under matching key only if the member was named. When building, the matching entry gets inserted into context before subcon gets build, and if subcon build returns a new value (not None) that gets replaced in the context.
+
+    This class supports embedding. :class:`~construct.core.Embedded` semantics dictate, that during instance creation (in ctor), each field is checked for embedded flag, and its subcons members merged. This changes behavior of some code examples. Only few classes are supported: Struct Sequence FocusedSeq Union, although those can be used interchangably (a Struct can embed a Sequence, or rather its members). EmbeddedBitStruct is not currently supported (yet to be resolved).
 
     .. warning:: If you skip `parsefrom` parameter then stream will be left back at starting offset, not seeked to any common denominator.
 
@@ -2777,14 +2909,15 @@ class Union(Construct):
         Alternative syntax, but requires Python 3.6:
         >>> Union(0, raw=Bytes(8), ints=Int32ub[2], shorts=Int16ub[4], chars=Byte[8])
     """
-    __slots__ = ["subcons","parsefrom"]
+    __slots__ = ["parsefrom", "subcons"]
 
     def __init__(self, parsefrom, *subcons, **kw):
         if isinstance(parsefrom, Construct):
             raise UnionError("parsefrom should be either: None int str context-function")
         super(Union, self).__init__()
-        self.subcons = list(subcons) + list(k/v for k,v in kw.items())
         self.parsefrom = parsefrom
+        subcons = list(subcons) + list(k/v for k,v in kw.items())
+        self.subcons = mergefields(*subcons)
 
     def _parse(self, stream, context, path):
         obj = Container()
@@ -2792,15 +2925,10 @@ class Union(Construct):
         fallback = _tell_stream(stream)
         forwards = {}
         for i,sc in enumerate(self.subcons):
-            if sc.flagembedded:
-                subobj = list(sc._parse(stream, context, path).items())
-                obj.update(subobj)
-                context.update(subobj)
-            else:
-                subobj = sc._parse(stream, context, path)
-                if sc.name:
-                    obj[sc.name] = subobj
-                    context[sc.name] = subobj
+            subobj = sc._parse(stream, context, path)
+            if sc.name:
+                obj[sc.name] = subobj
+                context[sc.name] = subobj
             forwards[i] = _tell_stream(stream)
             if sc.name:
                 forwards[sc.name] = _tell_stream(stream)
@@ -2816,29 +2944,20 @@ class Union(Construct):
         context = Container(_ = context)
         context.update(obj)
         for sc in self.subcons:
-            if sc.flagembedded:
-                subobj = obj
-            elif sc.flagbuildnone:
+            if sc.flagbuildnone:
                 subobj = obj.get(sc.name, None)
             elif sc.name in obj:
                 subobj = obj[sc.name]
             else:
                 continue
 
-            if sc.flagembedded:
-                if subobj is not None:
-                    context.update(subobj)
-            else:
-                if sc.name:
-                    context[sc.name] = subobj
+            if sc.name:
+                context[sc.name] = subobj
 
             buildret = sc._build(subobj, stream, context, path)
             if buildret is not None:
-                if sc.flagembedded:
-                    context.update(buildret)
-                else:
-                    if sc.name:
-                        context[sc.name] = buildret
+                if sc.name:
+                    context[sc.name] = buildret
             return buildret
         else:
             raise UnionError("cannot build, none of subcons were found in the dictionary %r" % (obj, ))
@@ -2870,14 +2989,9 @@ class Union(Construct):
             skipforward = self.subcons[index].sizeof() == self.subcons[-1].sizeof()
 
         for i,sc in enumerate(self.subcons):
-            if sc.flagembedded:
-                block += """
-                this.update(%s)
-                """ % (sc._compileparse(code), )
-            else:
-                block += """
+            block += """
                 %s%s
-                """ % ("this[%r] = " % sc.name if sc.name else "", sc._compileparse(code))
+            """ % ("this[%r] = " % sc.name if sc.name else "", sc._compileparse(code))
             if i == index and not skipforward:
                 block += """
                 forward = io.tell()
@@ -3403,20 +3517,23 @@ def BitStruct(*subcons, **kw):
     return Bitwise(Struct(*subcons, **kw))
 
 
-def EmbeddedBitStruct(*subcons, **kw):
-    r"""
-    Makes an embedded BitStruct.
+EmbeddedBitStruct = NotImplementedError
 
-    See :class:`~construct.core.Bitwise` and :class:`~construct.core.Embedded` and :class:`~construct.core.Struct` for semantics and raisable exceptions.
 
-    :param \*subcons: Construct instances, list of members, some can be anonymous
-    :param \*\*kw: Construct instances, list of members (requires Python 3.6)
+# def EmbeddedBitStruct(*subcons, **kw):
+#     r"""
+#     Makes an embedded BitStruct.
 
-    Example::
+#     See :class:`~construct.core.Bitwise` and :class:`~construct.core.Embedded` and :class:`~construct.core.Struct` for semantics and raisable exceptions.
 
-        EmbeddedBitStruct  <-->  Embedded(Bitwise(Struct(...)))
-    """
-    return Embedded(Bitwise(Struct(*subcons, **kw)))
+#     :param \*subcons: Construct instances, list of members, some can be anonymous
+#     :param \*\*kw: Construct instances, list of members (requires Python 3.6)
+
+#     Example::
+
+#         EmbeddedBitStruct  <-->  Embedded(Bitwise(Struct(...)))
+#     """
+#     return Embedded(Bitwise(Struct(*subcons, **kw)))
 
 
 #===============================================================================
