@@ -59,6 +59,8 @@ Development and support
 -------------------------
 Please use `github issues <https://github.com/construct/construct/issues>`_ to ask general questions, make feature requests, report issues and bugs, and to send in patches. Feel free to request any changes that would support your project. There also used to be a `mailing list <https://groups.google.com/d/forum/construct3>`_ but github issues should be preffered.
 
+There is also a `Gitter chat <https://gitter.im/construct-construct/Lobby>`_ but using Issues is highly recommended.
+
 Main documentation is at `readthedocs <http://construct.readthedocs.org>`_, where you can find all kinds of examples. Source is on `github <https://github.com/construct/construct>`_. Releases are available on `pypi <https://pypi.org/project/construct/>`_.
 
 
